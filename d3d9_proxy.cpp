@@ -18,6 +18,12 @@
 #include <cstdio>
 #include <cmath>
 
+#define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+
+#include "imgui/imgui.h"
+#include "imgui/backends/imgui_impl_dx9.h"
+#include "imgui/backends/imgui_impl_win32.h"
+
 #pragma comment(lib, "user32.lib")
 
 // Configuration
@@ -42,11 +48,17 @@ static int g_frameCount = 0;
 struct CameraMatrices {
     D3DMATRIX view;
     D3DMATRIX projection;
+    D3DMATRIX world;
+    D3DMATRIX mvp;
     bool hasView;
     bool hasProjection;
+    bool hasWorld;
+    bool hasMVP;
 };
 
 static CameraMatrices g_cameraMatrices = {};
+static bool g_imguiInitialized = false;
+static HWND g_imguiHwnd = nullptr;
 
 static void StoreViewMatrix(const D3DMATRIX& view) {
     g_cameraMatrices.view = view;
@@ -56,6 +68,16 @@ static void StoreViewMatrix(const D3DMATRIX& view) {
 static void StoreProjectionMatrix(const D3DMATRIX& projection) {
     g_cameraMatrices.projection = projection;
     g_cameraMatrices.hasProjection = true;
+}
+
+static void StoreWorldMatrix(const D3DMATRIX& world) {
+    g_cameraMatrices.world = world;
+    g_cameraMatrices.hasWorld = true;
+}
+
+static void StoreMVPMatrix(const D3DMATRIX& mvp) {
+    g_cameraMatrices.mvp = mvp;
+    g_cameraMatrices.hasMVP = true;
 }
 
 static HMODULE LoadSystemD3D9() {
@@ -71,6 +93,77 @@ static HMODULE LoadSystemD3D9() {
         module = LoadLibraryA("d3d9.dll");
     }
     return module;
+}
+
+static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
+    if (g_imguiInitialized || !device || !hwnd) {
+        return;
+    }
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+
+    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplDX9_Init(device);
+    g_imguiInitialized = true;
+    g_imguiHwnd = hwnd;
+}
+
+static void ShutdownImGui() {
+    if (!g_imguiInitialized) {
+        return;
+    }
+
+    ImGui_ImplDX9_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    g_imguiInitialized = false;
+    g_imguiHwnd = nullptr;
+}
+
+static void DrawMatrix(const char* label, const D3DMATRIX& mat, bool available) {
+    if (!available) {
+        ImGui::Text("%s: <unavailable>", label);
+        return;
+    }
+
+    ImGui::Text("%s:", label);
+    ImGui::Text("[%.3f %.3f %.3f %.3f]", mat._11, mat._12, mat._13, mat._14);
+    ImGui::Text("[%.3f %.3f %.3f %.3f]", mat._21, mat._22, mat._23, mat._24);
+    ImGui::Text("[%.3f %.3f %.3f %.3f]", mat._31, mat._32, mat._33, mat._34);
+    ImGui::Text("[%.3f %.3f %.3f %.3f]", mat._41, mat._42, mat._43, mat._44);
+}
+
+static void RenderImGuiOverlay() {
+    if (!g_imguiInitialized) {
+        return;
+    }
+
+    ImGui_ImplDX9_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    ImGui::SetNextWindowBgAlpha(0.7f);
+    ImGui::Begin("Camera Matrices", nullptr,
+                 ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoSavedSettings);
+    DrawMatrix("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld);
+    ImGui::Separator();
+    DrawMatrix("View", g_cameraMatrices.view, g_cameraMatrices.hasView);
+    ImGui::Separator();
+    DrawMatrix("Projection", g_cameraMatrices.projection, g_cameraMatrices.hasProjection);
+    ImGui::Separator();
+    DrawMatrix("MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
+    ImGui::End();
+
+    ImGui::EndFrame();
+    ImGui::Render();
+    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
 }
 
 // Function pointer types
@@ -207,6 +300,8 @@ private:
     IDirect3DDevice9* m_real;
     D3DMATRIX m_lastViewMatrix;
     D3DMATRIX m_lastProjMatrix;
+    D3DMATRIX m_lastWorldMatrix;
+    HWND m_hwnd = nullptr;
     bool m_hasView = false;
     bool m_hasProj = false;
     int m_constantLogThrottle = 0;
@@ -215,6 +310,14 @@ public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
         memset(&m_lastViewMatrix, 0, sizeof(D3DMATRIX));
         memset(&m_lastProjMatrix, 0, sizeof(D3DMATRIX));
+        memset(&m_lastWorldMatrix, 0, sizeof(D3DMATRIX));
+        D3DDEVICE_CREATION_PARAMETERS params = {};
+        if (SUCCEEDED(m_real->GetCreationParameters(&params))) {
+            m_hwnd = params.hFocusWindow;
+        }
+        if (!m_hwnd) {
+            m_hwnd = GetForegroundWindow();
+        }
         LogMsg("WrappedD3D9Device created, wrapping device at %p", real);
     }
 
@@ -236,6 +339,7 @@ public:
     ULONG STDMETHODCALLTYPE Release() override {
         ULONG count = m_real->Release();
         if (count == 0) {
+            ShutdownImGui();
             delete this;
         }
         return count;
@@ -268,6 +372,7 @@ public:
         if (StartRegister == 0 && Vector4fCount >= 4) {
             D3DMATRIX mvp;
             memcpy(&mvp, pConstantData, sizeof(D3DMATRIX));
+            StoreMVPMatrix(mvp);
 
             // Check for valid floats (skip LooksLikeMatrix - MVP has large values)
             bool validFloats = true;
@@ -376,6 +481,22 @@ public:
             }
         }
 
+        // Check for world matrix at configured register
+        if (g_config.worldMatrixRegister >= 0 &&
+            StartRegister <= (UINT)g_config.worldMatrixRegister &&
+            StartRegister + Vector4fCount >= (UINT)g_config.worldMatrixRegister + 4)
+        {
+            int offset = (g_config.worldMatrixRegister - StartRegister) * 4;
+            const float* matrixData = pConstantData + offset;
+
+            if (LooksLikeMatrix(matrixData)) {
+                D3DMATRIX mat;
+                memcpy(&mat, matrixData, sizeof(D3DMATRIX));
+                memcpy(&m_lastWorldMatrix, &mat, sizeof(D3DMATRIX));
+                StoreWorldMatrix(m_lastWorldMatrix);
+            }
+        }
+
         return m_real->SetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount);
     }
 
@@ -392,6 +513,11 @@ public:
         if (g_frameCount % 300 == 0) {
             LogMsg("Frame %d - hasView: %d, hasProj: %d", g_frameCount, m_hasView, m_hasProj);
         }
+
+        if (!g_imguiInitialized) {
+            InitializeImGui(m_real, m_hwnd);
+        }
+        RenderImGuiOverlay();
 
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     }
@@ -410,7 +536,16 @@ public:
     HRESULT STDMETHODCALLTYPE CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS* pPresentationParameters, IDirect3DSwapChain9** pSwapChain) override { return m_real->CreateAdditionalSwapChain(pPresentationParameters, pSwapChain); }
     HRESULT STDMETHODCALLTYPE GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9** pSwapChain) override { return m_real->GetSwapChain(iSwapChain, pSwapChain); }
     UINT STDMETHODCALLTYPE GetNumberOfSwapChains() override { return m_real->GetNumberOfSwapChains(); }
-    HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) override { return m_real->Reset(pPresentationParameters); }
+    HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) override {
+        if (g_imguiInitialized) {
+            ImGui_ImplDX9_InvalidateDeviceObjects();
+        }
+        HRESULT hr = m_real->Reset(pPresentationParameters);
+        if (SUCCEEDED(hr) && g_imguiInitialized) {
+            ImGui_ImplDX9_CreateDeviceObjects();
+        }
+        return hr;
+    }
     HRESULT STDMETHODCALLTYPE GetBackBuffer(UINT iSwapChain, UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface9** ppBackBuffer) override { return m_real->GetBackBuffer(iSwapChain, iBackBuffer, Type, ppBackBuffer); }
     HRESULT STDMETHODCALLTYPE GetRasterStatus(UINT iSwapChain, D3DRASTER_STATUS* pRasterStatus) override { return m_real->GetRasterStatus(iSwapChain, pRasterStatus); }
     HRESULT STDMETHODCALLTYPE SetDialogBoxMode(BOOL bEnableDialogs) override { return m_real->SetDialogBoxMode(bEnableDialogs); }
@@ -864,3 +999,11 @@ extern "C" {
         if (g_origD3DPERF_SetRegion) g_origD3DPERF_SetRegion(col, name);
     }
 }
+
+// Build helper: include ImGui sources for single-translation-unit builds.
+#include "imgui/imgui.cpp"
+#include "imgui/imgui_draw.cpp"
+#include "imgui/imgui_tables.cpp"
+#include "imgui/imgui_widgets.cpp"
+#include "imgui/backends/imgui_impl_dx9.cpp"
+#include "imgui/backends/imgui_impl_win32.cpp"
