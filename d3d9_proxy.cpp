@@ -1283,6 +1283,8 @@ public:
         }
         UpdateImGuiToggle();
         UpdatePauseToggle();
+        UpdateFreecamToggle();
+        UpdateFreecam(m_real, m_hwnd);
         RenderImGuiOverlay();
 
         if (g_pauseRendering) {
