@@ -105,11 +105,44 @@ static int g_selectedRegister = -1;
 static uintptr_t g_activeShaderKey = 0;
 static uintptr_t g_selectedShaderKey = 0;
 
+enum LayoutStrategyMode {
+    Layout_Auto = 0,
+    Layout_4x4 = 1,
+    Layout_4x3 = 2,
+    Layout_VP = 3,
+    Layout_MVP = 4
+};
+
+enum OverrideScopeMode {
+    Override_Sticky = 0,
+    Override_OneFrame = 1,
+    Override_NFrames = 2
+};
+
+struct HeuristicProfile {
+    bool valid = false;
+    int viewBase = 4;
+    int projBase = 8;
+    int layoutMode = Layout_Auto;
+    bool transposed = false;
+    bool inverseView = false;
+};
+
+static int g_layoutStrategyMode = Layout_Auto;
+static bool g_probeTransposedLayouts = true;
+static bool g_probeInverseView = true;
+static bool g_autoPickCandidates = true;
+static int g_overrideScopeMode = Override_Sticky;
+static int g_overrideNFrames = 3;
+static std::unordered_map<uintptr_t, uint32_t> g_shaderBytecodeHashes = {};
+static std::unordered_map<uint32_t, HeuristicProfile> g_heuristicProfiles = {};
+
 struct ShaderConstantState {
     float constants[kMaxConstantRegisters][4] = {};
     bool valid[kMaxConstantRegisters] = {};
     float overrideConstants[kMaxConstantRegisters][4] = {};
     bool overrideValid[kMaxConstantRegisters] = {};
+    int overrideFramesRemaining[kMaxConstantRegisters] = {};
     bool snapshotReady = false;
     unsigned long long sampleCount = 0;
     double mean[kMaxConstantRegisters][4] = {};
@@ -305,11 +338,129 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
     return &inserted.first->second;
 }
 
+
+static uint32_t ComputeShaderBytecodeHash(IDirect3DVertexShader9* shader) {
+    if (!shader) {
+        return 0;
+    }
+    UINT size = 0;
+    if (FAILED(shader->GetFunction(nullptr, &size)) || size == 0) {
+        return 0;
+    }
+    std::vector<uint8_t> data(size);
+    if (FAILED(shader->GetFunction(data.data(), &size)) || size == 0) {
+        return 0;
+    }
+    return HashBytesFNV1a(data.data(), size);
+}
+
+static void GetProfilesPath(char* outPath, size_t outSize) {
+    if (!outPath || outSize == 0) {
+        return;
+    }
+    GetModuleFileNameA(nullptr, outPath, static_cast<DWORD>(outSize));
+    char* lastSlash = strrchr(outPath, '\\');
+    if (lastSlash) {
+        strcpy(lastSlash + 1, "camera_proxy_profiles.ini");
+    }
+}
+
+static void SaveHeuristicProfile(uint32_t shaderHash, const HeuristicProfile& profile) {
+    char path[MAX_PATH] = {};
+    GetProfilesPath(path, MAX_PATH);
+    char section[64] = {};
+    snprintf(section, sizeof(section), "Shader_%08X", shaderHash);
+    char value[64] = {};
+
+    snprintf(value, sizeof(value), "%d", profile.valid ? 1 : 0);
+    WritePrivateProfileStringA(section, "Valid", value, path);
+    snprintf(value, sizeof(value), "%d", profile.viewBase);
+    WritePrivateProfileStringA(section, "ViewBase", value, path);
+    snprintf(value, sizeof(value), "%d", profile.projBase);
+    WritePrivateProfileStringA(section, "ProjBase", value, path);
+    snprintf(value, sizeof(value), "%d", profile.layoutMode);
+    WritePrivateProfileStringA(section, "LayoutMode", value, path);
+    snprintf(value, sizeof(value), "%d", profile.transposed ? 1 : 0);
+    WritePrivateProfileStringA(section, "Transposed", value, path);
+    snprintf(value, sizeof(value), "%d", profile.inverseView ? 1 : 0);
+    WritePrivateProfileStringA(section, "InverseView", value, path);
+}
+
+static void LoadHeuristicProfiles() {
+    g_heuristicProfiles.clear();
+    char path[MAX_PATH] = {};
+    GetProfilesPath(path, MAX_PATH);
+
+    char sections[32768] = {};
+    DWORD len = GetPrivateProfileSectionNamesA(sections, sizeof(sections), path);
+    if (len == 0) {
+        return;
+    }
+
+    const char* cur = sections;
+    while (*cur) {
+        uint32_t hash = 0;
+        if (sscanf(cur, "Shader_%08X", &hash) == 1) {
+            HeuristicProfile profile = {};
+            profile.valid = GetPrivateProfileIntA(cur, "Valid", 0, path) != 0;
+            profile.viewBase = GetPrivateProfileIntA(cur, "ViewBase", 4, path);
+            profile.projBase = GetPrivateProfileIntA(cur, "ProjBase", 8, path);
+            profile.layoutMode = GetPrivateProfileIntA(cur, "LayoutMode", Layout_Auto, path);
+            profile.transposed = GetPrivateProfileIntA(cur, "Transposed", 0, path) != 0;
+            profile.inverseView = GetPrivateProfileIntA(cur, "InverseView", 0, path) != 0;
+            if (profile.valid) {
+                g_heuristicProfiles[hash] = profile;
+            }
+        }
+        cur += strlen(cur) + 1;
+    }
+}
+
+static bool TryBuildMatrix4x3FromSnapshot(const ShaderConstantState& state, int baseRegister,
+                                          bool transposed, D3DMATRIX* outMatrix) {
+    if (!outMatrix || !state.snapshotReady || baseRegister < 0 || baseRegister + 2 >= kMaxConstantRegisters) {
+        return false;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (!state.valid[baseRegister + i]) {
+            return false;
+        }
+    }
+
+    D3DMATRIX m = {};
+    if (!transposed) {
+        m._11 = state.constants[baseRegister + 0][0]; m._12 = state.constants[baseRegister + 0][1]; m._13 = state.constants[baseRegister + 0][2]; m._14 = state.constants[baseRegister + 0][3];
+        m._21 = state.constants[baseRegister + 1][0]; m._22 = state.constants[baseRegister + 1][1]; m._23 = state.constants[baseRegister + 1][2]; m._24 = state.constants[baseRegister + 1][3];
+        m._31 = state.constants[baseRegister + 2][0]; m._32 = state.constants[baseRegister + 2][1]; m._33 = state.constants[baseRegister + 2][2]; m._34 = state.constants[baseRegister + 2][3];
+        m._41 = 0.0f; m._42 = 0.0f; m._43 = 0.0f; m._44 = 1.0f;
+    } else {
+        m._11 = state.constants[baseRegister + 0][0]; m._21 = state.constants[baseRegister + 0][1]; m._31 = state.constants[baseRegister + 0][2]; m._41 = state.constants[baseRegister + 0][3];
+        m._12 = state.constants[baseRegister + 1][0]; m._22 = state.constants[baseRegister + 1][1]; m._32 = state.constants[baseRegister + 1][2]; m._42 = state.constants[baseRegister + 1][3];
+        m._13 = state.constants[baseRegister + 2][0]; m._23 = state.constants[baseRegister + 2][1]; m._33 = state.constants[baseRegister + 2][2]; m._43 = state.constants[baseRegister + 2][3];
+        m._14 = 0.0f; m._24 = 0.0f; m._34 = 0.0f; m._44 = 1.0f;
+    }
+    *outMatrix = m;
+    return true;
+}
+
+static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
+    D3DMATRIX out = {};
+    out._11 = view._11; out._12 = view._21; out._13 = view._31;
+    out._21 = view._12; out._22 = view._22; out._23 = view._32;
+    out._31 = view._13; out._32 = view._23; out._33 = view._33;
+    out._44 = 1.0f;
+    out._41 = -(view._41 * out._11 + view._42 * out._21 + view._43 * out._31);
+    out._42 = -(view._41 * out._12 + view._42 * out._22 + view._43 * out._32);
+    out._43 = -(view._41 * out._13 + view._42 * out._23 + view._43 * out._33);
+    return out;
+}
+
 static void ClearAllShaderOverrides() {
     for (auto& entry : g_shaderConstants) {
         ShaderConstantState& state = entry.second;
         memset(state.overrideConstants, 0, sizeof(state.overrideConstants));
         memset(state.overrideValid, 0, sizeof(state.overrideValid));
+        memset(state.overrideFramesRemaining, 0, sizeof(state.overrideFramesRemaining));
     }
 }
 
@@ -323,9 +474,10 @@ static void ClearShaderRegisterOverride(uintptr_t shaderKey, int reg) {
     }
     memset(state->overrideConstants[reg], 0, sizeof(state->overrideConstants[reg]));
     state->overrideValid[reg] = false;
+    state->overrideFramesRemaining[reg] = 0;
 }
 
-static bool BuildOverriddenConstants(const ShaderConstantState& state,
+static bool BuildOverriddenConstants(ShaderConstantState& state,
                                      UINT startRegister,
                                      UINT vector4fCount,
                                      const float* sourceData,
@@ -355,8 +507,17 @@ static bool BuildOverriddenConstants(const ShaderConstantState& state,
         if (reg >= kMaxConstantRegisters) {
             break;
         }
-        if (state.overrideValid[reg]) {
-            memcpy(&scratch[i * 4], state.overrideConstants[reg], sizeof(state.overrideConstants[reg]));
+        if (!state.overrideValid[reg]) {
+            continue;
+        }
+
+        memcpy(&scratch[i * 4], state.overrideConstants[reg], sizeof(state.overrideConstants[reg]));
+
+        if (state.overrideFramesRemaining[reg] > 0) {
+            state.overrideFramesRemaining[reg]--;
+            if (state.overrideFramesRemaining[reg] == 0) {
+                state.overrideValid[reg] = false;
+            }
         }
     }
     return true;
@@ -382,6 +543,53 @@ static float GetVarianceMagnitude(const ShaderConstantState& state, int reg) {
         sum += state.m2[reg][i] / static_cast<double>(state.sampleCount - 1);
     }
     return static_cast<float>(sum / 4.0);
+}
+
+
+static bool TryBuildMatrixFromConstantUpdate(const float* constantData,
+                                             UINT startRegister,
+                                             UINT vector4fCount,
+                                             int baseRegister,
+                                             int rows,
+                                             bool transposed,
+                                             D3DMATRIX* outMatrix) {
+    if (!constantData || !outMatrix || rows < 3 || rows > 4) {
+        return false;
+    }
+    if (baseRegister < 0) {
+        return false;
+    }
+    if (startRegister > static_cast<UINT>(baseRegister) ||
+        startRegister + vector4fCount < static_cast<UINT>(baseRegister + rows)) {
+        return false;
+    }
+
+    int offset = (baseRegister - static_cast<int>(startRegister)) * 4;
+    const float* m = constantData + offset;
+    D3DMATRIX out = {};
+
+    if (!transposed) {
+        out._11 = m[0]; out._12 = m[1]; out._13 = m[2]; out._14 = m[3];
+        out._21 = m[4]; out._22 = m[5]; out._23 = m[6]; out._24 = m[7];
+        out._31 = m[8]; out._32 = m[9]; out._33 = m[10]; out._34 = m[11];
+        if (rows == 4) {
+            out._41 = m[12]; out._42 = m[13]; out._43 = m[14]; out._44 = m[15];
+        } else {
+            out._41 = 0.0f; out._42 = 0.0f; out._43 = 0.0f; out._44 = 1.0f;
+        }
+    } else {
+        out._11 = m[0]; out._21 = m[1]; out._31 = m[2]; out._41 = m[3];
+        out._12 = m[4]; out._22 = m[5]; out._32 = m[6]; out._42 = m[7];
+        out._13 = m[8]; out._23 = m[9]; out._33 = m[10]; out._43 = m[11];
+        if (rows == 4) {
+            out._14 = m[12]; out._24 = m[13]; out._34 = m[14]; out._44 = m[15];
+        } else {
+            out._14 = 0.0f; out._24 = 0.0f; out._34 = 0.0f; out._44 = 1.0f;
+        }
+    }
+
+    *outMatrix = out;
+    return true;
 }
 
 static bool TryBuildMatrixFromSnapshot(const ShaderConstantState& state, int baseRegister,
@@ -438,7 +646,18 @@ struct CandidateScore {
     int base = -1;
     float score = 0.0f;
     float variance = 0.0f;
+    int strategy = Layout_4x4;
+    bool transposed = false;
+    bool inverseView = false;
 };
+
+static float ComputeProjectionLikeScore(const D3DMATRIX& m) {
+    float score = 0.0f;
+    if (fabsf(m._34 - 1.0f) < 0.1f) score += 0.7f;
+    if (fabsf(m._44) < 0.1f) score += 0.5f;
+    if (fabsf(m._11) > 0.01f && fabsf(m._22) > 0.01f) score += 0.4f;
+    return score;
+}
 
 static void CollectTopCandidates(const ShaderConstantState& state,
                                  std::vector<CandidateScore>* outViewScores,
@@ -449,25 +668,69 @@ static void CollectTopCandidates(const ShaderConstantState& state,
     outViewScores->clear();
     outProjScores->clear();
 
-    for (int base = 0; base < kMaxConstantRegisters; base += 4) {
-        D3DMATRIX mat = {};
-        bool looksLike = false;
-        bool hasMatrix = TryBuildMatrixSnapshotInfo(state, base, &mat, &looksLike);
-        if (!hasMatrix || !looksLike) {
-            continue;
-        }
-        float variance = 0.0f;
-        for (int reg = base; reg < base + 4; reg++) {
-            variance += GetVarianceMagnitude(state, reg);
-        }
-        variance /= 4.0f;
-        float varianceScore = variance <= g_config.varianceThreshold ? 1.0f : 0.0f;
+    for (int base = 0; base < kMaxConstantRegisters; base++) {
+        // 4x4 strategy
+        if (base + 3 < kMaxConstantRegisters) {
+            D3DMATRIX mat = {};
+            bool looksLike = false;
+            bool hasMatrix = TryBuildMatrixSnapshotInfo(state, base, &mat, &looksLike);
+            if (hasMatrix && looksLike) {
+                float variance = 0.0f;
+                for (int reg = base; reg < base + 4; reg++) {
+                    variance += GetVarianceMagnitude(state, reg);
+                }
+                variance /= 4.0f;
+                float varianceScore = variance <= g_config.varianceThreshold ? 1.0f : 0.0f;
 
-        if (LooksLikeViewStrict(mat)) {
-            outViewScores->push_back({base, 1.0f + varianceScore, variance});
+                if (LooksLikeViewStrict(mat)) {
+                    outViewScores->push_back({base, 1.0f + varianceScore, variance, Layout_4x4, false, false});
+                    if (g_probeInverseView) {
+                        D3DMATRIX inv = InvertSimpleRigidView(mat);
+                        if (LooksLikeViewStrict(inv)) {
+                            outViewScores->push_back({base, 0.9f + varianceScore, variance, Layout_4x4, false, true});
+                        }
+                    }
+                }
+                if (LooksLikeProjectionStrict(mat)) {
+                    outProjScores->push_back({base, 1.0f + varianceScore, variance, Layout_4x4, false, false});
+                }
+
+                if (g_probeTransposedLayouts) {
+                    D3DMATRIX t = TransposeMatrix(mat);
+                    if (LooksLikeViewStrict(t)) {
+                        outViewScores->push_back({base, 0.95f + varianceScore, variance, Layout_4x4, true, false});
+                    }
+                    if (LooksLikeProjectionStrict(t)) {
+                        outProjScores->push_back({base, 0.95f + varianceScore, variance, Layout_4x4, true, false});
+                    }
+                }
+
+                // VP/WVP heuristics
+                float vpScore = ComputeProjectionLikeScore(mat);
+                if (vpScore > 0.0f) {
+                    outProjScores->push_back({base, 0.5f + vpScore + varianceScore * 0.5f, variance, Layout_VP, false, false});
+                }
+            }
         }
-        if (LooksLikeProjectionStrict(mat)) {
-            outProjScores->push_back({base, 1.0f + varianceScore, variance});
+
+        // 4x3 strategy
+        if (base + 2 < kMaxConstantRegisters) {
+            for (int transposed = 0; transposed < (g_probeTransposedLayouts ? 2 : 1); transposed++) {
+                D3DMATRIX m43 = {};
+                if (!TryBuildMatrix4x3FromSnapshot(state, base, transposed != 0, &m43)) {
+                    continue;
+                }
+                float variance = 0.0f;
+                for (int reg = base; reg < base + 3; reg++) {
+                    variance += GetVarianceMagnitude(state, reg);
+                }
+                variance /= 3.0f;
+                float varianceScore = variance <= g_config.varianceThreshold ? 1.0f : 0.0f;
+
+                if (LooksLikeViewStrict(m43)) {
+                    outViewScores->push_back({base, 0.95f + varianceScore, variance, Layout_4x3, transposed != 0, false});
+                }
+            }
         }
     }
 
@@ -495,16 +758,16 @@ static void LogTopCandidates(const ShaderConstantState& state, uintptr_t shaderK
     LogMsg("Candidate summary for shader 0x%p", reinterpret_cast<void*>(shaderKey));
     int count = 0;
     for (const auto& entry : viewScores) {
-        LogMsg("  VIEW c%d-c%d score %.2f variance %.6f", entry.base, entry.base + 3,
-               entry.score, entry.variance);
+        LogMsg("  VIEW c%d-c%d score %.2f variance %.6f strategy %d transposed %d inverse %d", entry.base, entry.base + 3,
+               entry.score, entry.variance, entry.strategy, entry.transposed ? 1 : 0, entry.inverseView ? 1 : 0);
         if (++count >= g_config.topCandidateCount) {
             break;
         }
     }
     count = 0;
     for (const auto& entry : projScores) {
-        LogMsg("  PROJ c%d-c%d score %.2f variance %.6f", entry.base, entry.base + 3,
-               entry.score, entry.variance);
+        LogMsg("  PROJ c%d-c%d score %.2f variance %.6f strategy %d transposed %d", entry.base, entry.base + 3,
+               entry.score, entry.variance, entry.strategy, entry.transposed ? 1 : 0);
         if (++count >= g_config.topCandidateCount) {
             break;
         }
@@ -805,6 +1068,12 @@ static void RenderImGuiOverlay() {
             if (ImGui::Button("Reset all overrides")) {
                 ClearAllShaderOverrides();
             }
+            static const char* kOverrideModes[] = {"Sticky", "One-frame", "N-frames"};
+            ImGui::Combo("Override scope", &g_overrideScopeMode, kOverrideModes, IM_ARRAYSIZE(kOverrideModes));
+            if (g_overrideScopeMode == Override_NFrames) {
+                ImGui::InputInt("Override frames", &g_overrideNFrames);
+                if (g_overrideNFrames < 1) g_overrideNFrames = 1;
+            }
 
             ShaderConstantState* editState = GetShaderState(g_selectedShaderKey, false);
             if (g_selectedRegister >= 0) {
@@ -821,6 +1090,13 @@ static void RenderImGuiOverlay() {
                         memcpy(editState->overrideConstants[g_selectedRegister], editValues,
                                sizeof(editState->overrideConstants[g_selectedRegister]));
                         editState->overrideValid[g_selectedRegister] = true;
+                        if (g_overrideScopeMode == Override_OneFrame) {
+                            editState->overrideFramesRemaining[g_selectedRegister] = 1;
+                        } else if (g_overrideScopeMode == Override_NFrames) {
+                            editState->overrideFramesRemaining[g_selectedRegister] = g_overrideNFrames;
+                        } else {
+                            editState->overrideFramesRemaining[g_selectedRegister] = -1;
+                        }
                     }
                     ImGui::SameLine();
                     if (ImGui::Button("Reset selected override")) {
@@ -922,6 +1198,12 @@ static void RenderImGuiOverlay() {
 
         if (ImGui::BeginTabItem("Heuristics")) {
             ImGui::Text("Matrix detection heuristics and candidates");
+            static const char* kLayoutModes[] = {"Auto", "4x4", "4x3", "VP", "MVP"};
+            ImGui::Combo("Layout strategy", &g_layoutStrategyMode, kLayoutModes, IM_ARRAYSIZE(kLayoutModes));
+            ImGui::Checkbox("Probe transposed layouts", &g_probeTransposedLayouts);
+            ImGui::SameLine();
+            ImGui::Checkbox("Probe inverse-view", &g_probeInverseView);
+            ImGui::Checkbox("Auto-pick top candidates", &g_autoPickCandidates);
             ImGui::InputInt("Stability frames", &g_config.stabilityFrames);
             ImGui::InputFloat("Variance threshold", &g_config.varianceThreshold, 0.0005f, 0.001f, "%.6f");
             ImGui::InputInt("Top candidate count", &g_config.topCandidateCount);
@@ -931,17 +1213,49 @@ static void RenderImGuiOverlay() {
             if (g_config.varianceThreshold < 0.0f) g_config.varianceThreshold = 0.0f;
 
             ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
+            uint32_t selectedHash = 0;
+            auto hashIt = g_shaderBytecodeHashes.find(g_selectedShaderKey);
+            if (hashIt != g_shaderBytecodeHashes.end()) {
+                selectedHash = hashIt->second;
+            }
+
             if (state && state->snapshotReady) {
                 std::vector<CandidateScore> viewScores;
                 std::vector<CandidateScore> projScores;
                 CollectTopCandidates(*state, &viewScores, &projScores);
 
+                if (g_autoPickCandidates && !viewScores.empty()) {
+                    const CandidateScore& topView = viewScores.front();
+                    g_config.viewMatrixRegister = topView.base;
+                    g_layoutStrategyMode = topView.strategy;
+                }
+                if (g_autoPickCandidates && !projScores.empty()) {
+                    const CandidateScore& topProj = projScores.front();
+                    g_config.projMatrixRegister = topProj.base;
+                }
+
+                if (selectedHash != 0 && ImGui::Button("Save profile for selected shader")) {
+                    HeuristicProfile profile = {};
+                    profile.valid = true;
+                    profile.viewBase = g_config.viewMatrixRegister;
+                    profile.projBase = g_config.projMatrixRegister;
+                    profile.layoutMode = g_layoutStrategyMode;
+                    profile.transposed = g_probeTransposedLayouts;
+                    profile.inverseView = g_probeInverseView;
+                    g_heuristicProfiles[selectedHash] = profile;
+                    SaveHeuristicProfile(selectedHash, profile);
+                    LogMsg("Saved heuristic profile for shader hash 0x%08X", selectedHash);
+                }
+
                 ImGui::Separator();
                 ImGui::Text("VIEW candidates");
-                if (ImGui::BeginTable("ViewCandidates", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                if (ImGui::BeginTable("ViewCandidates", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
                     ImGui::TableSetupColumn("Registers");
                     ImGui::TableSetupColumn("Score");
                     ImGui::TableSetupColumn("Variance");
+                    ImGui::TableSetupColumn("Strategy");
+                    ImGui::TableSetupColumn("Transpose");
+                    ImGui::TableSetupColumn("Inverse");
                     ImGui::TableHeadersRow();
                     int count = 0;
                     for (const auto& c : viewScores) {
@@ -950,16 +1264,21 @@ static void RenderImGuiOverlay() {
                         ImGui::TableSetColumnIndex(0); ImGui::Text("c%d-c%d", c.base, c.base + 3);
                         ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", c.score);
                         ImGui::TableSetColumnIndex(2); ImGui::Text("%.6f", c.variance);
+                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", kLayoutModes[std::max(0, std::min(c.strategy, 4))]);
+                        ImGui::TableSetColumnIndex(4); ImGui::Text("%s", c.transposed ? "yes" : "no");
+                        ImGui::TableSetColumnIndex(5); ImGui::Text("%s", c.inverseView ? "yes" : "no");
                     }
                     ImGui::EndTable();
                 }
 
                 ImGui::Separator();
                 ImGui::Text("PROJECTION candidates");
-                if (ImGui::BeginTable("ProjCandidates", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                if (ImGui::BeginTable("ProjCandidates", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
                     ImGui::TableSetupColumn("Registers");
                     ImGui::TableSetupColumn("Score");
                     ImGui::TableSetupColumn("Variance");
+                    ImGui::TableSetupColumn("Strategy");
+                    ImGui::TableSetupColumn("Transpose");
                     ImGui::TableHeadersRow();
                     int count = 0;
                     for (const auto& c : projScores) {
@@ -968,6 +1287,8 @@ static void RenderImGuiOverlay() {
                         ImGui::TableSetColumnIndex(0); ImGui::Text("c%d-c%d", c.base, c.base + 3);
                         ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", c.score);
                         ImGui::TableSetColumnIndex(2); ImGui::Text("%.6f", c.variance);
+                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", kLayoutModes[std::max(0, std::min(c.strategy, 4))]);
+                        ImGui::TableSetColumnIndex(4); ImGui::Text("%s", c.transposed ? "yes" : "no");
                     }
                     ImGui::EndTable();
                 }
@@ -975,6 +1296,9 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("Select a shader in Constants tab first.");
             }
             ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabItem();
         }
 
         if (ImGui::BeginTabItem("Memory Scanner")) {
@@ -1465,68 +1789,76 @@ public:
         }
 
         // Configured register detection
-        // Check for view matrix at configured register
-        if (g_config.viewMatrixRegister >= 0 &&
-            StartRegister <= (UINT)g_config.viewMatrixRegister &&
-            StartRegister + Vector4fCount >= (UINT)g_config.viewMatrixRegister + 4)
-        {
-            int offset = (g_config.viewMatrixRegister - StartRegister) * 4;
-            const float* matrixData = effectiveConstantData + offset;
+        int configuredRows = (g_layoutStrategyMode == Layout_4x3) ? 3 : 4;
+        bool configuredTranspose = (g_layoutStrategyMode == Layout_Auto) ? g_probeTransposedLayouts : false;
 
-            if (LooksLikeMatrix(matrixData)) {
-                D3DMATRIX mat;
-                memcpy(&mat, matrixData, sizeof(D3DMATRIX));
+        // Check for view matrix at configured register
+        if (g_config.viewMatrixRegister >= 0) {
+            for (int transposePass = 0; transposePass < (configuredTranspose ? 2 : 1); transposePass++) {
+                D3DMATRIX mat = {};
+                if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                      g_config.viewMatrixRegister, configuredRows,
+                                                      transposePass != 0, &mat)) {
+                    continue;
+                }
 
                 bool viewStrict = LooksLikeViewStrict(mat);
+                if (!viewStrict && g_probeInverseView) {
+                    D3DMATRIX inv = InvertSimpleRigidView(mat);
+                    if (LooksLikeViewStrict(inv)) {
+                        mat = inv;
+                        viewStrict = true;
+                    }
+                }
                 if (viewStrict || LooksLikeView(mat)) {
                     memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasView = true;
                     StoreViewMatrix(m_lastViewMatrix);
                     EmitFixedFunctionTransforms();
-                    LogMsg("Extracted VIEW matrix from c%d", g_config.viewMatrixRegister);
+                    LogMsg("Extracted VIEW matrix from c%d (rows=%d transpose=%d)",
+                           g_config.viewMatrixRegister, configuredRows, transposePass != 0 ? 1 : 0);
                     UpdateStability(*state, g_config.viewMatrixRegister, viewStrict, false);
+                    break;
                 }
             }
         }
 
         // Check for projection matrix at configured register
-        if (g_config.projMatrixRegister >= 0 &&
-            StartRegister <= (UINT)g_config.projMatrixRegister &&
-            StartRegister + Vector4fCount >= (UINT)g_config.projMatrixRegister + 4)
-        {
-            int offset = (g_config.projMatrixRegister - StartRegister) * 4;
-            const float* matrixData = effectiveConstantData + offset;
-
-            if (LooksLikeMatrix(matrixData)) {
-                D3DMATRIX mat;
-                memcpy(&mat, matrixData, sizeof(D3DMATRIX));
+        if (g_config.projMatrixRegister >= 0) {
+            for (int transposePass = 0; transposePass < (configuredTranspose ? 2 : 1); transposePass++) {
+                D3DMATRIX mat = {};
+                if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                      g_config.projMatrixRegister, configuredRows,
+                                                      transposePass != 0, &mat)) {
+                    continue;
+                }
 
                 bool projStrict = LooksLikeProjectionStrict(mat);
-                if (projStrict || LooksLikeProjection(mat)) {
+                bool projLike = LooksLikeProjection(mat);
+                if (!projStrict && !projLike && g_layoutStrategyMode == Layout_VP) {
+                    projLike = ComputeProjectionLikeScore(mat) > 1.0f;
+                }
+                if (projStrict || projLike) {
                     memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasProj = true;
                     StoreProjectionMatrix(m_lastProjMatrix);
                     EmitFixedFunctionTransforms();
 
                     float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
-                    LogMsg("Extracted PROJECTION matrix from c%d (FOV: %.1f deg)",
-                           g_config.projMatrixRegister, fov);
+                    LogMsg("Extracted PROJECTION matrix from c%d (rows=%d transpose=%d FOV: %.1f deg)",
+                           g_config.projMatrixRegister, configuredRows, transposePass != 0 ? 1 : 0, fov);
                     UpdateStability(*state, g_config.projMatrixRegister, false, projStrict);
+                    break;
                 }
             }
         }
 
         // Check for world matrix at configured register
-        if (g_config.worldMatrixRegister >= 0 &&
-            StartRegister <= (UINT)g_config.worldMatrixRegister &&
-            StartRegister + Vector4fCount >= (UINT)g_config.worldMatrixRegister + 4)
-        {
-            int offset = (g_config.worldMatrixRegister - StartRegister) * 4;
-            const float* matrixData = effectiveConstantData + offset;
-
-            if (LooksLikeMatrix(matrixData)) {
-                D3DMATRIX mat;
-                memcpy(&mat, matrixData, sizeof(D3DMATRIX));
+        if (g_config.worldMatrixRegister >= 0) {
+            D3DMATRIX mat = {};
+            if (TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                 g_config.worldMatrixRegister, configuredRows,
+                                                 false, &mat) && LooksLikeMatrix(reinterpret_cast<const float*>(&mat))) {
                 memcpy(&m_lastWorldMatrix, &mat, sizeof(D3DMATRIX));
                 m_hasWorld = true;
                 StoreWorldMatrix(m_lastWorldMatrix);
@@ -1694,6 +2026,24 @@ public:
         m_currentVertexShader = pShader;
         g_activeShaderKey = reinterpret_cast<uintptr_t>(pShader);
         GetShaderState(g_activeShaderKey, true);
+
+        if (pShader) {
+            uint32_t shaderHash = ComputeShaderBytecodeHash(pShader);
+            if (shaderHash != 0) {
+                g_shaderBytecodeHashes[g_activeShaderKey] = shaderHash;
+                auto profileIt = g_heuristicProfiles.find(shaderHash);
+                if (profileIt != g_heuristicProfiles.end() && profileIt->second.valid) {
+                    const HeuristicProfile& profile = profileIt->second;
+                    g_config.viewMatrixRegister = profile.viewBase;
+                    g_config.projMatrixRegister = profile.projBase;
+                    g_layoutStrategyMode = profile.layoutMode;
+                    g_probeTransposedLayouts = profile.transposed;
+                    g_probeInverseView = profile.inverseView;
+                    LogMsg("Applied heuristic profile for shader hash 0x%08X", shaderHash);
+                }
+            }
+        }
+
         return m_real->SetVertexShader(pShader);
     }
     HRESULT STDMETHODCALLTYPE GetVertexShader(IDirect3DVertexShader9** ppShader) override { return m_real->GetVertexShader(ppShader); }
@@ -1949,6 +2299,12 @@ void LoadConfig() {
     g_config.emitFixedFunctionTransforms = GetPrivateProfileIntA("CameraProxy", "EmitFixedFunctionTransforms", 1, path) != 0;
     GetPrivateProfileStringA("CameraProxy", "RemixDllName", "d3d9_remix.dll", g_config.remixDllName,
                              MAX_PATH, path);
+    g_layoutStrategyMode = GetPrivateProfileIntA("CameraProxy", "LayoutStrategyMode", Layout_Auto, path);
+    g_probeTransposedLayouts = GetPrivateProfileIntA("CameraProxy", "ProbeTransposedLayouts", 1, path) != 0;
+    g_probeInverseView = GetPrivateProfileIntA("CameraProxy", "ProbeInverseView", 1, path) != 0;
+    g_autoPickCandidates = GetPrivateProfileIntA("CameraProxy", "AutoPickCandidates", 1, path) != 0;
+    g_overrideScopeMode = GetPrivateProfileIntA("CameraProxy", "OverrideScopeMode", Override_Sticky, path);
+    g_overrideNFrames = GetPrivateProfileIntA("CameraProxy", "OverrideNFrames", 3, path);
 
     char buf[64];
     GetPrivateProfileStringA("CameraProxy", "MinFOV", "0.1", buf, sizeof(buf), path);
@@ -1963,6 +2319,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         DisableThreadLibraryCalls(hinstDLL);
 
         LoadConfig();
+        LoadHeuristicProfiles();
 
         if (g_config.enableLogging) {
             g_logFile = fopen("camera_proxy.log", "w");
@@ -1978,6 +2335,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             LogMsg("Use Remix runtime: %s", g_config.useRemixRuntime ? "ENABLED" : "disabled");
             LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
             LogMsg("Emit fixed-function transforms: %s", g_config.emitFixedFunctionTransforms ? "ENABLED" : "disabled");
+            LogMsg("Layout strategy mode: %d", g_layoutStrategyMode);
+            LogMsg("Probe transposed layouts: %s", g_probeTransposedLayouts ? "ENABLED" : "disabled");
+            LogMsg("Probe inverse view: %s", g_probeInverseView ? "ENABLED" : "disabled");
+            LogMsg("Override scope mode: %d (N=%d)", g_overrideScopeMode, g_overrideNFrames);
             if (g_config.enableMemoryScanner) {
                 LogMsg("Memory scanner interval: %d sec", g_config.memoryScannerIntervalSec);
                 LogMsg("Memory scanner module: %s", g_config.memoryScannerModule[0]
