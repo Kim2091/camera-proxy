@@ -45,6 +45,18 @@ Edit `camera_proxy.ini` to adjust behavior:
 | `EnableLogging` | 1 | Write diagnostic output to `camera_proxy.log` |
 | `AutoDetectMatrices` | 0 | Scan all constants for view/projection matrices |
 | `LogAllConstants` | 0 | Log all shader constant updates (very verbose) |
+| `LayoutStrategyMode` | 0 | Heuristic layout strategy (0=Auto, 1=4x4, 2=4x3, 3=VP, 4=MVP) |
+| `ProbeTransposedLayouts` | 1 | Probe transposed row/column-major matrix conventions |
+| `ProbeInverseView` | 1 | Probe inverse-view interpretation for view candidates |
+| `AutoPickCandidates` | 1 | Auto-apply top view/projection candidates in Heuristics tab |
+| `OverrideScopeMode` | 0 | Shader override lifetime (0=Sticky, 1=One-frame, 2=N-frames) |
+| `OverrideNFrames` | 3 | Lifetime in frames when `OverrideScopeMode=2` |
+
+You can also open the in-game constants view and enable **shader constant editing** to override individual `c#` registers live; overrides are injected into the final `SetVertexShaderConstantF` call (so changes affect rendering) and can be reset per-register or globally from the UI.
+
+The ImGui overlay is now organized into tabs for **Camera**, **Constants**, **Heuristics**, **Memory Scanner**, and **Logs** so matrix candidates, memory-scan results, and runtime logs can be reviewed in one place.
+
+Heuristic profiles can be saved per shader (hashed by shader bytecode) and persisted in `camera_proxy_profiles.ini` to avoid repeating setup across runs.
 
 You can also open the in-game constants view and enable **shader constant editing** to override individual `c#` registers live; overrides are injected into the final `SetVertexShaderConstantF` call (so changes affect rendering) and can be reset per-register or globally from the UI.
 
