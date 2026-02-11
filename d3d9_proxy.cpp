@@ -202,7 +202,7 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
 
 static std::unordered_map<uintptr_t, ShaderConstantState> g_shaderConstants = {};
 static std::vector<uintptr_t> g_shaderOrder = {};
-static std::unordered_map<uintptr_t, bool> g_disabledShaderZeroing = {};
+static std::unordered_map<uintptr_t, bool> g_disabledShaders = {};
 static unsigned long long g_constantChangeSerial = 0;
 static HANDLE g_memoryScannerThread = nullptr;
 static DWORD g_memoryScannerThreadId = 0;
@@ -414,15 +414,19 @@ static uint32_t GetShaderHashForKey(uintptr_t shaderKey) {
 }
 
 static bool IsShaderDisabled(uintptr_t shaderKey) {
-    auto it = g_disabledShaderZeroing.find(shaderKey);
-    return it != g_disabledShaderZeroing.end() && it->second;
+    auto it = g_disabledShaders.find(shaderKey);
+    return it != g_disabledShaders.end() && it->second;
 }
 
 static void SetShaderDisabled(uintptr_t shaderKey, bool disabled) {
     if (shaderKey == 0) {
         return;
     }
-    g_disabledShaderZeroing[shaderKey] = disabled;
+    g_disabledShaders[shaderKey] = disabled;
+}
+
+static bool IsCurrentShaderDrawDisabled(IDirect3DVertexShader9* shader) {
+    return IsShaderDisabled(reinterpret_cast<uintptr_t>(shader));
 }
 
 static float GetShaderFlashStrength(const ShaderConstantState* state) {
@@ -1366,7 +1370,7 @@ static void RenderImGuiOverlay() {
                 }
                 ImGui::SameLine();
                 bool disableSelected = IsShaderDisabled(g_selectedShaderKey);
-                if (ImGui::Checkbox("Disable shader (zero constants)", &disableSelected)) {
+                if (ImGui::Checkbox("Disable shader draws", &disableSelected)) {
                     SetShaderDisabled(g_selectedShaderKey, disableSelected);
                 }
             } else {
@@ -2057,16 +2061,11 @@ public:
         ShaderConstantState* state = GetShaderState(shaderKey, true);
 
         std::vector<float> overrideScratch;
-        std::vector<float> disabledScratch;
         const float* effectiveConstantData = pConstantData;
         if (BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
             effectiveConstantData = overrideScratch.data();
         }
 
-        if (IsShaderDisabled(shaderKey) && Vector4fCount > 0) {
-            disabledScratch.assign(Vector4fCount * 4, 0.0f);
-            effectiveConstantData = disabledScratch.data();
-        }
 
         bool constantsChanged = false;
 
@@ -2437,25 +2436,25 @@ public:
     HRESULT STDMETHODCALLTYPE SetNPatchMode(float nSegments) override { return m_real->SetNPatchMode(nSegments); }
     float STDMETHODCALLTYPE GetNPatchMode() override { return m_real->GetNPatchMode(); }
     HRESULT STDMETHODCALLTYPE DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) override {
-        if (g_pauseRendering && !g_isRenderingImGui) {
+        if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
         return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
     }
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) override {
-        if (g_pauseRendering && !g_isRenderingImGui) {
+        if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
         return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
     }
     HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
-        if (g_pauseRendering && !g_isRenderingImGui) {
+        if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
         return m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
     }
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void* pIndexData, D3DFORMAT IndexDataFormat, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
-        if (g_pauseRendering && !g_isRenderingImGui) {
+        if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
         return m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
