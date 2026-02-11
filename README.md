@@ -6,12 +6,12 @@ Like DMC4, many other directx9.0c games use a fully programmable shader pipeline
 
 ## Setup
 
-1. Install [RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix) into your DMC4 game folder
+1. Install [RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix) into your game folder
 2. Rename Remix's `d3d9.dll` to `d3d9_remix.dll`
 3. Copy `d3d9.dll` (this proxy) into the game folder
 4. Copy `camera_proxy.ini` into the game folder
 5. Optionally copy `rtx.conf` for tuned Remix settings
-6. Run the game
+6. Run the game, Press Alt+M to toggle the Imgui menu
 
 The proxy can chain to either `d3d9_remix.dll` (default) or the system `d3d9.dll`, controlled by `camera_proxy.ini`.
 
