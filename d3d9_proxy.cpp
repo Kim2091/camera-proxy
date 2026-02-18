@@ -45,10 +45,17 @@ static bool LooksLikeViewStrict(const D3DMATRIX& m);
 static bool LooksLikeProjectionStrict(const D3DMATRIX& m);
 float ExtractFOV(const D3DMATRIX& proj);
 
+static float Dot3(float ax, float ay, float az, float bx, float by, float bz);
+
 enum ProjectionHandedness {
     ProjectionHandedness_Unknown = 0,
     ProjectionHandedness_Left,
     ProjectionHandedness_Right
+};
+
+enum CustomProjectionMode {
+    CustomProjectionMode_Manual = 1,
+    CustomProjectionMode_Auto = 2
 };
 
 struct ProjectionAnalysis {
@@ -59,6 +66,7 @@ struct ProjectionAnalysis {
 
 static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out);
 static const char* ProjectionHandednessLabel(ProjectionHandedness handedness);
+static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant = nullptr);
 void CreateIdentityMatrix(D3DMATRIX* out);
 class WrappedD3D9Device;
 
@@ -97,17 +105,23 @@ struct ProxyConfig {
     bool combinedMVPLogDecomposition = false;
 
     bool experimentalCustomProjectionEnabled = false;
-    int experimentalCustomProjectionMode = 2; // 1 = manual matrix, 2 = auto-generated
+    CustomProjectionMode experimentalCustomProjectionMode = CustomProjectionMode_Auto;
     bool experimentalCustomProjectionOverrideDetectedProjection = false;
     bool experimentalCustomProjectionOverrideCombinedMVP = false;
     bool mgrrUseAutoProjectionWhenC4Invalid = false;
     bool barnyardUseGameSetTransformsForViewProjection = true;
+    bool disableGameInputWhileMenuOpen = false;
+    bool setTransformBypassProxyWhenGameProvides = false;
+    bool setTransformRoundTripCompatibilityMode = false;
     float experimentalCustomProjectionAutoFovDeg = 60.0f;
     float experimentalCustomProjectionAutoNearZ = 0.1f;
     float experimentalCustomProjectionAutoFarZ = 1000.0f;
     float experimentalCustomProjectionAutoAspectFallback = 16.0f / 9.0f;
-    int experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
+    ProjectionHandedness experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
     D3DMATRIX experimentalCustomProjectionManualMatrix = {};
+    bool experimentalInverseViewAsWorld = false;
+    bool experimentalInverseViewAsWorldAllowUnverified = false;
+    bool experimentalInverseViewAsWorldFast = false;
 };
 
 enum CombinedMVPStrategy {
@@ -161,6 +175,8 @@ static bool g_barnyardForceWorldFromC0 = false;
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
+static HINSTANCE g_moduleInstance = nullptr;
+static std::once_flag g_initOnce;
 static FILE* g_logFile = nullptr;
 static int g_frameCount = 0;
 
@@ -211,6 +227,7 @@ struct MatrixSourceInfo {
 
 static CameraMatrices g_cameraMatrices = {};
 static MatrixSourceInfo g_matrixSources[MatrixSlot_Count] = {};
+static std::mutex g_cameraMatricesMutex;
 static ManualMatrixBinding g_manualBindings[MatrixSlot_Count] = {};
 static void UpdateMatrixSource(MatrixSlot slot,
                                uintptr_t shaderKey,
@@ -224,6 +241,7 @@ static void UpdateMatrixSource(MatrixSlot slot,
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
 static bool g_showImGui = false;
+static bool g_prevShowImGui = false;
 static bool g_pauseRendering = false;
 static bool g_isRenderingImGui = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
@@ -236,6 +254,7 @@ static float g_imguiScaleRuntime = 1.0f;
 static ImGuiStyle g_imguiBaseStyle = {};
 static bool g_imguiMgrrUseAutoProjection = false;
 static bool g_imguiBarnyardUseGameSetTransformsForViewProjection = true;
+static bool g_imguiDisableGameInputWhileMenuOpen = false;
 static bool g_imguiBaseStyleCaptured = false;
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
@@ -248,6 +267,15 @@ static int g_projectionDetectedRegister = -1;
 static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
 static CombinedMVPDebugState g_combinedMvpDebug = {};
 static char g_customProjectionStatus[256] = "";
+static bool g_lastInverseViewAsWorldEligible = false;
+static bool g_lastInverseViewAsWorldApplied = false;
+static bool g_lastInverseViewAsWorldUsedFast = false;
+static bool g_gameSetTransformSeen[3] = { false, false, false }; // world, view, projection
+static bool g_gameSetTransformAnySeen = false;
+
+static HHOOK g_keyboardBlockHook = nullptr;
+static HHOOK g_mouseBlockHook = nullptr;
+static bool g_imguiAsyncKeyboardPrev[256] = {};
 
 enum HotkeyAction {
     HotkeyAction_ToggleMenu = 0,
@@ -262,6 +290,7 @@ static bool g_hotkeyWasDown[HotkeyAction_Count] = {};
 static int g_iniViewMatrixRegister = -1;
 static int g_iniProjMatrixRegister = -1;
 static int g_iniWorldMatrixRegister = -1;
+static char g_iniPath[MAX_PATH] = {};
 
 static constexpr int kMaxConstantRegisters = 256;
 static int g_selectedRegister = -1;
@@ -275,6 +304,7 @@ enum OverrideScopeMode {
 };
 
 static bool g_probeTransposedLayouts = true;
+static bool g_constantUploadRecordingEnabled = false;
 static bool g_probeInverseView = true;
 static int g_overrideScopeMode = Override_Sticky;
 static int g_overrideNFrames = 3;
@@ -297,15 +327,11 @@ struct ShaderConstantState {
     bool valid[kMaxConstantRegisters] = {};
     float overrideConstants[kMaxConstantRegisters][4] = {};
     bool overrideValid[kMaxConstantRegisters] = {};
-    int overrideFramesRemaining[kMaxConstantRegisters] = {};
+    int overrideExpiresAtFrame[kMaxConstantRegisters];
     bool snapshotReady = false;
-    unsigned long long sampleCount = 0;
+    unsigned long long sampleCounts[kMaxConstantRegisters] = {};
     double mean[kMaxConstantRegisters][4] = {};
     double m2[kMaxConstantRegisters][4] = {};
-    int stableViewBase = -1;
-    int stableViewCount = 0;
-    int stableProjBase = -1;
-    int stableProjCount = 0;
     unsigned long long lastChangeSerial = 0;
 };
 
@@ -386,6 +412,9 @@ static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ImGuiIO& io = ImGui::GetIO();
             const bool keyboardMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || msg == WM_CHAR || msg == WM_SYSCHAR;
             const bool mouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
+            if (g_config.disableGameInputWhileMenuOpen && (keyboardMsg || mouseMsg)) {
+                return TRUE;
+            }
             if ((keyboardMsg && io.WantCaptureKeyboard) || (mouseMsg && io.WantCaptureMouse)) {
                 return TRUE;
             }
@@ -397,6 +426,177 @@ static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPA
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+static bool ShouldBypassInputForImGuiMenu() {
+    return g_imguiInitialized && g_showImGui && g_config.disableGameInputWhileMenuOpen;
+}
+
+static bool IsProxyHotkeyVk(DWORD vkCode) {
+    return vkCode == static_cast<DWORD>(g_config.hotkeyToggleMenuVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyTogglePauseVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyEmitMatricesVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyResetMatrixOverridesVk);
+}
+
+static LRESULT CALLBACK LowLevelKeyboardBlockHook(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && ShouldBypassInputForImGuiMenu()) {
+        const KBDLLHOOKSTRUCT* keyInfo = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (keyInfo && !IsProxyHotkeyVk(keyInfo->vkCode)) {
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_keyboardBlockHook, nCode, wParam, lParam);
+}
+
+static LRESULT CALLBACK LowLevelMouseBlockHook(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && ShouldBypassInputForImGuiMenu()) {
+        return 1;
+    }
+    return CallNextHookEx(g_mouseBlockHook, nCode, wParam, lParam);
+}
+
+static void UpdateInputBlockHooks() {
+    const bool shouldBlock = ShouldBypassInputForImGuiMenu();
+    if (shouldBlock) {
+        if (!g_keyboardBlockHook) {
+            g_keyboardBlockHook = SetWindowsHookExA(WH_KEYBOARD_LL, LowLevelKeyboardBlockHook, g_moduleInstance, 0);
+        }
+        if (!g_mouseBlockHook) {
+            g_mouseBlockHook = SetWindowsHookExA(WH_MOUSE_LL, LowLevelMouseBlockHook, g_moduleInstance, 0);
+        }
+    } else {
+        if (g_keyboardBlockHook) {
+            UnhookWindowsHookEx(g_keyboardBlockHook);
+            g_keyboardBlockHook = nullptr;
+        }
+        if (g_mouseBlockHook) {
+            UnhookWindowsHookEx(g_mouseBlockHook);
+            g_mouseBlockHook = nullptr;
+        }
+    }
+}
+
+static ImGuiKey VkToImGuiKey(UINT vk) {
+    if (vk >= '0' && vk <= '9') return static_cast<ImGuiKey>(ImGuiKey_0 + (vk - '0'));
+    if (vk >= 'A' && vk <= 'Z') return static_cast<ImGuiKey>(ImGuiKey_A + (vk - 'A'));
+    if (vk >= VK_F1 && vk <= VK_F12) return static_cast<ImGuiKey>(ImGuiKey_F1 + (vk - VK_F1));
+    switch (vk) {
+    case VK_TAB: return ImGuiKey_Tab;
+    case VK_LEFT: return ImGuiKey_LeftArrow;
+    case VK_RIGHT: return ImGuiKey_RightArrow;
+    case VK_UP: return ImGuiKey_UpArrow;
+    case VK_DOWN: return ImGuiKey_DownArrow;
+    case VK_PRIOR: return ImGuiKey_PageUp;
+    case VK_NEXT: return ImGuiKey_PageDown;
+    case VK_HOME: return ImGuiKey_Home;
+    case VK_END: return ImGuiKey_End;
+    case VK_INSERT: return ImGuiKey_Insert;
+    case VK_DELETE: return ImGuiKey_Delete;
+    case VK_BACK: return ImGuiKey_Backspace;
+    case VK_SPACE: return ImGuiKey_Space;
+    case VK_RETURN: return ImGuiKey_Enter;
+    case VK_ESCAPE: return ImGuiKey_Escape;
+    case VK_OEM_7: return ImGuiKey_Apostrophe;
+    case VK_OEM_COMMA: return ImGuiKey_Comma;
+    case VK_OEM_MINUS: return ImGuiKey_Minus;
+    case VK_OEM_PERIOD: return ImGuiKey_Period;
+    case VK_OEM_2: return ImGuiKey_Slash;
+    case VK_OEM_1: return ImGuiKey_Semicolon;
+    case VK_OEM_PLUS: return ImGuiKey_Equal;
+    case VK_OEM_4: return ImGuiKey_LeftBracket;
+    case VK_OEM_5: return ImGuiKey_Backslash;
+    case VK_OEM_6: return ImGuiKey_RightBracket;
+    case VK_OEM_3: return ImGuiKey_GraveAccent;
+    case VK_CAPITAL: return ImGuiKey_CapsLock;
+    case VK_SCROLL: return ImGuiKey_ScrollLock;
+    case VK_NUMLOCK: return ImGuiKey_NumLock;
+    case VK_SNAPSHOT: return ImGuiKey_PrintScreen;
+    case VK_PAUSE: return ImGuiKey_Pause;
+    case VK_NUMPAD0: return ImGuiKey_Keypad0;
+    case VK_NUMPAD1: return ImGuiKey_Keypad1;
+    case VK_NUMPAD2: return ImGuiKey_Keypad2;
+    case VK_NUMPAD3: return ImGuiKey_Keypad3;
+    case VK_NUMPAD4: return ImGuiKey_Keypad4;
+    case VK_NUMPAD5: return ImGuiKey_Keypad5;
+    case VK_NUMPAD6: return ImGuiKey_Keypad6;
+    case VK_NUMPAD7: return ImGuiKey_Keypad7;
+    case VK_NUMPAD8: return ImGuiKey_Keypad8;
+    case VK_NUMPAD9: return ImGuiKey_Keypad9;
+    case VK_DECIMAL: return ImGuiKey_KeypadDecimal;
+    case VK_DIVIDE: return ImGuiKey_KeypadDivide;
+    case VK_MULTIPLY: return ImGuiKey_KeypadMultiply;
+    case VK_SUBTRACT: return ImGuiKey_KeypadSubtract;
+    case VK_ADD: return ImGuiKey_KeypadAdd;
+    case VK_LSHIFT: return ImGuiKey_LeftShift;
+    case VK_RSHIFT: return ImGuiKey_RightShift;
+    case VK_LCONTROL: return ImGuiKey_LeftCtrl;
+    case VK_RCONTROL: return ImGuiKey_RightCtrl;
+    case VK_LMENU: return ImGuiKey_LeftAlt;
+    case VK_RMENU: return ImGuiKey_RightAlt;
+    case VK_LWIN: return ImGuiKey_LeftSuper;
+    case VK_RWIN: return ImGuiKey_RightSuper;
+    case VK_APPS: return ImGuiKey_Menu;
+    default: return ImGuiKey_None;
+    }
+}
+
+static void UpdateImGuiKeyboardFromAsyncState() {
+    if (!g_showImGui || !g_imguiInitialized) {
+        memset(g_imguiAsyncKeyboardPrev, 0, sizeof(g_imguiAsyncKeyboardPrev));
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    for (UINT vk = 0; vk < 256; ++vk) {
+        const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+        const bool prev = g_imguiAsyncKeyboardPrev[vk];
+        if (down == prev) {
+            continue;
+        }
+        g_imguiAsyncKeyboardPrev[vk] = down;
+        const ImGuiKey key = VkToImGuiKey(vk);
+        if (key != ImGuiKey_None) {
+            io.AddKeyEvent(key, down);
+            io.SetKeyEventNativeData(key, vk, static_cast<int>(MapVirtualKeyA(vk, MAPVK_VK_TO_VSC)));
+        }
+        if (down) {
+            BYTE keyboardState[256] = {};
+            if (GetKeyboardState(keyboardState)) {
+                WCHAR utf16Buf[4] = {};
+                const int translated = ToUnicode(vk,
+                                                 MapVirtualKeyA(vk, MAPVK_VK_TO_VSC),
+                                                 keyboardState,
+                                                 utf16Buf,
+                                                 4,
+                                                 0);
+                if (translated > 0) {
+                    for (int i = 0; i < translated; ++i) {
+                        io.AddInputCharacterUTF16(utf16Buf[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    io.AddKeyEvent(ImGuiMod_Ctrl, (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Shift, (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Alt, (GetAsyncKeyState(VK_MENU) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Super, (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+                                  (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
+}
+
+static void EnsureWndProcHookInstalled() {
+    if (!g_imguiInitialized || !g_imguiHwnd) {
+        return;
+    }
+    WNDPROC current = reinterpret_cast<WNDPROC>(
+        GetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC));
+    if (current != ImGuiWndProcHook) {
+        g_imguiPrevWndProc = current;
+        SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC,
+                         reinterpret_cast<LONG_PTR>(ImGuiWndProcHook));
+    }
+}
+
 static void StoreViewMatrix(const D3DMATRIX& view,
                             uintptr_t shaderKey = 0,
                             int baseRegister = -1,
@@ -405,8 +605,11 @@ static void StoreViewMatrix(const D3DMATRIX& view,
                             bool manual = false,
                             const char* sourceLabel = nullptr,
                             int extractedFromRegister = -1) {
-    g_cameraMatrices.view = view;
-    g_cameraMatrices.hasView = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.view = view;
+        g_cameraMatrices.hasView = true;
+    }
     UpdateMatrixSource(MatrixSlot_View, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -419,8 +622,11 @@ static void StoreProjectionMatrix(const D3DMATRIX& projection,
                                   bool manual = false,
                                   const char* sourceLabel = nullptr,
                                   int extractedFromRegister = -1) {
-    g_cameraMatrices.projection = projection;
-    g_cameraMatrices.hasProjection = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.projection = projection;
+        g_cameraMatrices.hasProjection = true;
+    }
     UpdateMatrixSource(MatrixSlot_Projection, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -433,8 +639,11 @@ static void StoreWorldMatrix(const D3DMATRIX& world,
                              bool manual = false,
                              const char* sourceLabel = nullptr,
                              int extractedFromRegister = -1) {
-    g_cameraMatrices.world = world;
-    g_cameraMatrices.hasWorld = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.world = world;
+        g_cameraMatrices.hasWorld = true;
+    }
     UpdateMatrixSource(MatrixSlot_World, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -447,8 +656,11 @@ static void StoreMVPMatrix(const D3DMATRIX& mvp,
                            bool manual = false,
                            const char* sourceLabel = nullptr,
                            int extractedFromRegister = -1) {
-    g_cameraMatrices.mvp = mvp;
-    g_cameraMatrices.hasMVP = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.mvp = mvp;
+        g_cameraMatrices.hasMVP = true;
+    }
     UpdateMatrixSource(MatrixSlot_MVP, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -462,8 +674,11 @@ static void StoreVPMatrix(const D3DMATRIX& vp,
                           bool manual = false,
                           const char* sourceLabel = nullptr,
                           int extractedFromRegister = -1) {
-    g_cameraMatrices.vp = vp;
-    g_cameraMatrices.hasVP = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.vp = vp;
+        g_cameraMatrices.hasVP = true;
+    }
     UpdateMatrixSource(MatrixSlot_VP, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -476,8 +691,11 @@ static void StoreWVMatrix(const D3DMATRIX& wv,
                           bool manual = false,
                           const char* sourceLabel = nullptr,
                           int extractedFromRegister = -1) {
-    g_cameraMatrices.wv = wv;
-    g_cameraMatrices.hasWV = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.wv = wv;
+        g_cameraMatrices.hasWV = true;
+    }
     UpdateMatrixSource(MatrixSlot_WV, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -612,15 +830,25 @@ static void ShutdownImGui() {
         return;
     }
 
+    // Remove our hook first so ImGui_ImplWin32_Shutdown restores correctly.
+    if (g_imguiHwnd && g_imguiPrevWndProc) {
+        WNDPROC current = reinterpret_cast<WNDPROC>(
+            GetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC));
+        if (current == ImGuiWndProcHook) {
+            SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC,
+                             reinterpret_cast<LONG_PTR>(g_imguiPrevWndProc));
+        }
+    }
+
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+    g_showImGui = false;
     g_imguiInitialized = false;
-    if (g_imguiPrevWndProc && g_imguiHwnd) {
-        SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_imguiPrevWndProc));
-    }
+    UpdateInputBlockHooks();
     g_imguiPrevWndProc = nullptr;
     g_imguiHwnd = nullptr;
+    g_prevShowImGui = false;
 }
 
 static void DrawMatrix(const char* label, const D3DMATRIX& mat, bool available) {
@@ -715,7 +943,7 @@ static void BuildShaderComboLabel(uintptr_t shaderKey, char* outLabel, size_t ou
     bool disabled = IsShaderDisabled(shaderKey);
     float flash = GetShaderFlashStrength(state);
     uint32_t displayHash = GetShaderHashForKey(shaderKey);
-    snprintf(outLabel, outSize, "0x%p (hash 0x%08X)%s%s%s",
+    snprintf(outLabel, outSize, "%p (hash 0x%08X)%s%s%s",
              reinterpret_cast<void*>(shaderKey),
              displayHash,
              shaderKey == g_activeShaderKey ? " (active)" : "",
@@ -747,6 +975,7 @@ static void UpdateMatrixSource(MatrixSlot slot,
     info.transposed = transposed;
     info.sourceLabel = sourceLabel ? sourceLabel : (manual ? "manual constants selection" : "auto/config detection");
     info.extractedFromRegister = extractedFromRegister >= 0 ? extractedFromRegister : baseRegister;
+    std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
     g_matrixSources[slot] = info;
 }
 
@@ -755,7 +984,11 @@ static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
         return;
     }
 
-    const MatrixSourceInfo& source = g_matrixSources[slot];
+    MatrixSourceInfo source = {};
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        source = g_matrixSources[slot];
+    }
     if (!source.valid) {
         ImGui::Text("Source: <unknown>");
         return;
@@ -766,7 +999,7 @@ static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
     if (source.shaderKey == 0) {
         ImGui::Text("Source shader: <none/runtime>");
     } else {
-        ImGui::Text("Source shader: 0x%p", reinterpret_cast<void*>(source.shaderKey));
+        ImGui::Text("Source shader: %p", reinterpret_cast<void*>(source.shaderKey));
         if (hasBytecodeHash) {
             ImGui::Text("Shader hash: 0x%08X", shaderHash);
         } else if (source.shaderHash != 0) {
@@ -828,16 +1061,10 @@ static const char* MatrixSlotLabel(MatrixSlot slot) {
 }
 
 static bool SaveConfigRegisterValue(const char* key, int value) {
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    char* lastSlash = strrchr(path, '\\');
-    if (lastSlash) {
-        strcpy(lastSlash + 1, "camera_proxy.ini");
-    }
-
+    if (g_iniPath[0] == '\0') return false;
     char valueBuf[32] = {};
     snprintf(valueBuf, sizeof(valueBuf), "%d", value);
-    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, path) != FALSE;
+    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, g_iniPath) != FALSE;
 }
 
 static bool SaveConfigBoolValue(const char* key, bool value) {
@@ -845,16 +1072,10 @@ static bool SaveConfigBoolValue(const char* key, bool value) {
 }
 
 static bool SaveConfigFloatValue(const char* key, float value) {
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    char* lastSlash = strrchr(path, '\\');
-    if (lastSlash) {
-        strcpy(lastSlash + 1, "camera_proxy.ini");
-    }
-
+    if (g_iniPath[0] == '\0') return false;
     char valueBuf[64] = {};
     snprintf(valueBuf, sizeof(valueBuf), "%.7g", value);
-    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, path) != FALSE;
+    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, g_iniPath) != FALSE;
 }
 
 static bool ConsumeSingleKeyHotkey(HotkeyAction action, int virtualKey) {
@@ -890,7 +1111,11 @@ static void ResetMatrixRegisterOverridesToAuto() {
 }
 
 static void PinRegisterFromSource(MatrixSlot slot) {
-    const MatrixSourceInfo& source = g_matrixSources[slot];
+    MatrixSourceInfo source = {};
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        source = g_matrixSources[slot];
+    }
     if (!source.valid || source.baseRegister < 0) {
         snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
                  "Cannot pin %s: no register-backed source available.", MatrixSlotLabel(slot));
@@ -963,7 +1188,7 @@ static void TryAssignManualMatrixFromSelection(MatrixSlot slot,
     }
 
     snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
-             "Assigned %s from shader 0x%p registers c%d-c%d (%d rows).",
+             "Assigned %s from shader %p registers c%d-c%d (%d rows).",
              MatrixSlotLabel(slot), reinterpret_cast<void*>(shaderKey), baseRegister,
              baseRegister + rows - 1, rows);
 }
@@ -1000,9 +1225,23 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
     }
     g_shaderOrder.push_back(shaderKey);
     auto inserted = g_shaderConstants.emplace(shaderKey, ShaderConstantState{});
+    for (int i = 0; i < kMaxConstantRegisters; ++i) inserted.first->second.overrideExpiresAtFrame[i] = -1;
     return &inserted.first->second;
 }
 
+
+static void OnVertexShaderReleased(uintptr_t shaderKey) {
+    if (shaderKey == 0) {
+        return;
+    }
+    g_shaderConstants.erase(shaderKey);
+    g_disabledShaders.erase(shaderKey);
+    g_shaderBytecodeHashes.erase(shaderKey);
+    auto it = std::find(g_shaderOrder.begin(), g_shaderOrder.end(), shaderKey);
+    if (it != g_shaderOrder.end()) {
+        g_shaderOrder.erase(it);
+    }
+}
 
 static uint32_t ComputeShaderBytecodeHash(IDirect3DVertexShader9* shader) {
     if (!shader) {
@@ -1058,6 +1297,48 @@ static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
     return out;
 }
 
+static bool ViewMatrixCanUseFastInverse(const D3DMATRIX& view) {
+    const float row0len = sqrtf(Dot3(view._11, view._12, view._13, view._11, view._12, view._13));
+    const float row1len = sqrtf(Dot3(view._21, view._22, view._23, view._21, view._22, view._23));
+    const float row2len = sqrtf(Dot3(view._31, view._32, view._33, view._31, view._32, view._33));
+
+    if (fabsf(row0len - 1.0f) > 0.05f || fabsf(row1len - 1.0f) > 0.05f || fabsf(row2len - 1.0f) > 0.05f) {
+        return false;
+    }
+    if (fabsf(Dot3(view._11, view._12, view._13, view._21, view._22, view._23)) > 0.05f) return false;
+    if (fabsf(Dot3(view._11, view._12, view._13, view._31, view._32, view._33)) > 0.05f) return false;
+    if (fabsf(Dot3(view._21, view._22, view._23, view._31, view._32, view._33)) > 0.05f) return false;
+    if (fabsf(view._14) > 0.01f || fabsf(view._24) > 0.01f || fabsf(view._34) > 0.01f || fabsf(view._44 - 1.0f) > 0.01f) {
+        return false;
+    }
+    return true;
+}
+
+static bool TryBuildWorldFromView(const D3DMATRIX& view, bool preferFastInverse, D3DMATRIX* outWorld,
+                                  bool* outUsedFast, bool* outFastEligible) {
+    if (!outWorld) {
+        return false;
+    }
+
+    const bool fastEligible = ViewMatrixCanUseFastInverse(view);
+    if (outFastEligible) {
+        *outFastEligible = fastEligible;
+    }
+
+    if (preferFastInverse && fastEligible) {
+        *outWorld = InvertSimpleRigidView(view);
+        if (outUsedFast) {
+            *outUsedFast = true;
+        }
+        return true;
+    }
+
+    if (outUsedFast) {
+        *outUsedFast = false;
+    }
+    return InvertMatrix4x4Deterministic(view, outWorld, nullptr);
+}
+
 static const char* GameProfileLabel(GameProfileKind profile) {
     switch (profile) {
         case GameProfile_Barnyard: return "Barnyard";
@@ -1107,7 +1388,7 @@ static void ConfigureActiveProfileLayout() {
     }
 }
 
-static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant = nullptr) {
+static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant) {
     if (!out) {
         return false;
     }
@@ -1248,7 +1529,7 @@ static void ClearAllShaderOverrides() {
         ShaderConstantState& state = entry.second;
         memset(state.overrideConstants, 0, sizeof(state.overrideConstants));
         memset(state.overrideValid, 0, sizeof(state.overrideValid));
-        memset(state.overrideFramesRemaining, 0, sizeof(state.overrideFramesRemaining));
+        for (int i = 0; i < kMaxConstantRegisters; ++i) state.overrideExpiresAtFrame[i] = -1;
     }
 }
 
@@ -1262,7 +1543,7 @@ static void ClearShaderRegisterOverride(uintptr_t shaderKey, int reg) {
     }
     memset(state->overrideConstants[reg], 0, sizeof(state->overrideConstants[reg]));
     state->overrideValid[reg] = false;
-    state->overrideFramesRemaining[reg] = 0;
+    state->overrideExpiresAtFrame[reg] = -1;
 }
 
 static bool BuildOverriddenConstants(ShaderConstantState& state,
@@ -1301,34 +1582,34 @@ static bool BuildOverriddenConstants(ShaderConstantState& state,
 
         memcpy(&scratch[i * 4], state.overrideConstants[reg], sizeof(state.overrideConstants[reg]));
 
-        if (state.overrideFramesRemaining[reg] > 0) {
-            state.overrideFramesRemaining[reg]--;
-            if (state.overrideFramesRemaining[reg] == 0) {
-                state.overrideValid[reg] = false;
-            }
+        if (state.overrideExpiresAtFrame[reg] >= 0 &&
+            g_frameCount >= state.overrideExpiresAtFrame[reg]) {
+            state.overrideValid[reg] = false;
+            state.overrideExpiresAtFrame[reg] = -1;
+            continue;
         }
     }
     return true;
 }
 
 static void UpdateVariance(ShaderConstantState& state, int reg, const float* values) {
-    state.sampleCount++;
+    state.sampleCounts[reg]++;
     for (int i = 0; i < 4; i++) {
         double value = static_cast<double>(values[i]);
         double delta = value - state.mean[reg][i];
-        state.mean[reg][i] += delta / static_cast<double>(state.sampleCount);
+        state.mean[reg][i] += delta / static_cast<double>(state.sampleCounts[reg]);
         double delta2 = value - state.mean[reg][i];
         state.m2[reg][i] += delta * delta2;
     }
 }
 
 static float GetVarianceMagnitude(const ShaderConstantState& state, int reg) {
-    if (state.sampleCount < 2) {
+    if (state.sampleCounts[reg] < 2) {
         return 0.0f;
     }
     double sum = 0.0;
     for (int i = 0; i < 4; i++) {
-        sum += state.m2[reg][i] / static_cast<double>(state.sampleCount - 1);
+        sum += state.m2[reg][i] / static_cast<double>(state.sampleCounts[reg] - 1);
     }
     return static_cast<float>(sum / 4.0);
 }
@@ -1609,6 +1890,8 @@ static void UpdateConstantSnapshot() {
 }
 
 static void UpdateHotkeys() {
+    EnsureWndProcHookInstalled();
+
     if (ConsumeSingleKeyHotkey(HotkeyAction_ToggleMenu, g_config.hotkeyToggleMenuVk)) {
         g_showImGui = !g_showImGui;
     }
@@ -1631,6 +1914,13 @@ static void UpdateHotkeys() {
     if (ConsumeSingleKeyHotkey(HotkeyAction_ResetMatrixOverrides, g_config.hotkeyResetMatrixOverridesVk)) {
         ResetMatrixRegisterOverridesToAuto();
     }
+
+    if (g_showImGui && !g_prevShowImGui) {
+        // Menu just became visible — release any game mouse capture.
+        ReleaseCapture();
+    }
+    g_prevShowImGui = g_showImGui;
+    UpdateInputBlockHooks();
 }
 
 static void UpdateFrameTimeStats() {
@@ -1666,13 +1956,49 @@ static void UpdateFrameTimeStats() {
 }
 
 static void RenderImGuiOverlay() {
+    EnsureWndProcHookInstalled();
+
     if (!g_imguiInitialized || !g_showImGui) {
+        g_constantUploadRecordingEnabled = false;
         return;
+    }
+
+    ClipCursor(NULL);
+
+    CameraMatrices camSnapshot = {};
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        camSnapshot = g_cameraMatrices;
     }
 
     ApplyImGuiScale(g_imguiHwnd);
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    UpdateImGuiKeyboardFromAsyncState();
+    if (g_showImGui) {
+        POINT cursorScreen = {};
+        if (GetCursorPos(&cursorScreen) && ScreenToClient(g_imguiHwnd, &cursorScreen)) {
+            ImGui::GetIO().MousePos = ImVec2(
+                static_cast<float>(cursorScreen.x),
+                static_cast<float>(cursorScreen.y));
+        }
+        ImGuiIO& io = ImGui::GetIO();
+        io.MouseDown[0] = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        io.MouseDown[1] = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+
+        io.KeyCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        io.KeyShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        io.KeyAlt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+        static const int kNavKeys[] = {
+            VK_TAB, VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
+            VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_DELETE,
+            VK_BACK, VK_RETURN, VK_ESCAPE, VK_SPACE
+        };
+        for (int vk : kNavKeys) {
+            io.KeysDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        }
+    }
     ImGui::GetIO().MouseDrawCursor = true;
     ImGui::NewFrame();
 
@@ -1693,6 +2019,12 @@ static void RenderImGuiOverlay() {
     if (ImGui::SliderFloat("UI scale", &g_imguiScaleRuntime, 0.5f, 3.0f, "%.2fx")) {
         ApplyImGuiScale(g_imguiHwnd);
         g_config.imguiScale = g_imguiScaleRuntime;
+    }
+
+    if (ImGui::Checkbox("Disable game input while menu is open", &g_imguiDisableGameInputWhileMenuOpen)) {
+        g_config.disableGameInputWhileMenuOpen = g_imguiDisableGameInputWhileMenuOpen;
+        SaveConfigBoolValue("DisableGameInputWhileMenuOpen", g_config.disableGameInputWhileMenuOpen);
+        UpdateInputBlockHooks();
     }
 
     if (ImGui::Button("Pass camera matrices to RTX Remix (SetTransform)")) {
@@ -1744,6 +2076,22 @@ static void RenderImGuiOverlay() {
     if (ImGui::BeginTabBar("MainTabs")) {
         if (ImGui::BeginTabItem("Camera")) {
             ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
+            ImGui::Text("Game SetTransform seen: WORLD=%s VIEW=%s PROJECTION=%s",
+                        g_gameSetTransformSeen[0] ? "yes" : "no",
+                        g_gameSetTransformSeen[1] ? "yes" : "no",
+                        g_gameSetTransformSeen[2] ? "yes" : "no");
+            if (g_gameSetTransformAnySeen) {
+                if (ImGui::Checkbox("Bypass proxy WVP emit when game provides SetTransform", &g_config.setTransformBypassProxyWhenGameProvides)) {
+                    SaveConfigBoolValue("SetTransformBypassProxyWhenGameProvides",
+                                        g_config.setTransformBypassProxyWhenGameProvides);
+                }
+                if (ImGui::Checkbox("Round-trip game SetTransform via GetTransform for strict compatibility", &g_config.setTransformRoundTripCompatibilityMode)) {
+                    SaveConfigBoolValue("SetTransformRoundTripCompatibilityMode",
+                                        g_config.setTransformRoundTripCompatibilityMode);
+                }
+            } else {
+                ImGui::TextDisabled("SetTransform compatibility options unlock once game calls SetTransform(WORLD/VIEW/PROJECTION).");
+            }
             if (g_activeGameProfile == GameProfile_MetalGearRising) {
                 ImGui::Text("MGR layout: Proj=c4-c7, ViewProjection=c8-c11, World=c16-c19");
                 ImGui::Checkbox("Use auto projection when c4 is invalid", &g_imguiMgrrUseAutoProjection);
@@ -1755,7 +2103,7 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("Projection c4-c7 validity: %s", g_mgrProjectionRegisterValid ? "valid" : "invalid");
                 float activeViewDeterminant = 0.0f;
                 D3DMATRIX activeViewInverse = {};
-                InvertMatrix4x4Deterministic(g_cameraMatrices.view, &activeViewInverse, &activeViewDeterminant);
+                InvertMatrix4x4Deterministic(camSnapshot.view, &activeViewInverse, &activeViewDeterminant);
                 ImGui::Text("Determinant of active View matrix: %.6f", activeViewDeterminant);
                 ImGui::Text("Captured this frame: Proj=%s View=%s",
                             g_mgrProjCapturedThisFrame ? "yes" : "no",
@@ -1799,17 +2147,34 @@ static void RenderImGuiOverlay() {
                 }
             }
             ImGui::Separator();
-            DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
+            DrawMatrixWithTranspose("World", camSnapshot.world, camSnapshot.hasWorld,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_World, g_cameraMatrices.hasWorld);
+            DrawMatrixSourceInfo(MatrixSlot_World, camSnapshot.hasWorld);
             ImGui::Separator();
-            DrawMatrixWithTranspose("View", g_cameraMatrices.view, g_cameraMatrices.hasView,
+            DrawMatrixWithTranspose("View", camSnapshot.view, camSnapshot.hasView,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_View, g_cameraMatrices.hasView);
+            DrawMatrixSourceInfo(MatrixSlot_View, camSnapshot.hasView);
+            if (ImGui::CollapsingHeader("Experimental inverse View -> World", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::Checkbox("Use inverse(View) as emitted World matrix", &g_config.experimentalInverseViewAsWorld)) {
+                    SaveConfigBoolValue("ExperimentalInverseViewAsWorld", g_config.experimentalInverseViewAsWorld);
+                }
+                if (ImGui::Checkbox("Allow inverse(View) even if strict validity check fails", &g_config.experimentalInverseViewAsWorldAllowUnverified)) {
+                    SaveConfigBoolValue("ExperimentalInverseViewAsWorldAllowUnverified",
+                                        g_config.experimentalInverseViewAsWorldAllowUnverified);
+                }
+                if (ImGui::Checkbox("Fast inverse (rigid transform only)", &g_config.experimentalInverseViewAsWorldFast)) {
+                    SaveConfigBoolValue("ExperimentalInverseViewAsWorldFast",
+                                        g_config.experimentalInverseViewAsWorldFast);
+                }
+                ImGui::TextWrapped("Fast inverse assumes no scaling/shear: transpose the 3x3 rotation and recompute translation via negative dot products.");
+                ImGui::Text("Last strict validity result: %s", g_lastInverseViewAsWorldEligible ? "valid" : "invalid");
+                ImGui::Text("Last inverse(View)->World application: %s", g_lastInverseViewAsWorldApplied ? "applied" : "not applied");
+                ImGui::Text("Last method: %s", g_lastInverseViewAsWorldUsedFast ? "fast inverse" : "full 4x4 inverse");
+            }
             ImGui::Separator();
-            DrawMatrixWithTranspose("Projection", g_cameraMatrices.projection,
-                                    g_cameraMatrices.hasProjection, g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_Projection, g_cameraMatrices.hasProjection);
+            DrawMatrixWithTranspose("Projection", camSnapshot.projection,
+                                    camSnapshot.hasProjection, g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_Projection, camSnapshot.hasProjection);
             if (g_projectionDetectedByNumericStructure) {
                 ImGui::Text("Projection numeric detection: ACTIVE");
                 ImGui::Text("FOV: %.2f deg (%.3f rad)",
@@ -1830,13 +2195,13 @@ static void RenderImGuiOverlay() {
                 if (!g_config.experimentalCustomProjectionEnabled) {
                     ImGui::TextWrapped("Set ExperimentalCustomProjectionEnabled=1 in camera_proxy.ini to activate this section.");
                 } else {
-                    if (ImGui::RadioButton("Manual matrix", g_config.experimentalCustomProjectionMode == 1)) {
-                        g_config.experimentalCustomProjectionMode = 1;
+                    if (ImGui::RadioButton("Manual matrix", g_config.experimentalCustomProjectionMode == CustomProjectionMode_Manual)) {
+                        g_config.experimentalCustomProjectionMode = CustomProjectionMode_Manual;
                         SaveConfigRegisterValue("ExperimentalCustomProjectionMode", g_config.experimentalCustomProjectionMode);
                     }
                     ImGui::SameLine();
-                    if (ImGui::RadioButton("Auto-generate", g_config.experimentalCustomProjectionMode == 2)) {
-                        g_config.experimentalCustomProjectionMode = 2;
+                    if (ImGui::RadioButton("Auto-generate", g_config.experimentalCustomProjectionMode == CustomProjectionMode_Auto)) {
+                        g_config.experimentalCustomProjectionMode = CustomProjectionMode_Auto;
                         SaveConfigRegisterValue("ExperimentalCustomProjectionMode", g_config.experimentalCustomProjectionMode);
                     }
 
@@ -1849,7 +2214,7 @@ static void RenderImGuiOverlay() {
                                             g_config.experimentalCustomProjectionOverrideCombinedMVP);
                     }
 
-                    if (g_config.experimentalCustomProjectionMode == 1) {
+                    if (g_config.experimentalCustomProjectionMode == CustomProjectionMode_Manual) {
                         float rows[4][4] = {
                             { g_config.experimentalCustomProjectionManualMatrix._11, g_config.experimentalCustomProjectionManualMatrix._12, g_config.experimentalCustomProjectionManualMatrix._13, g_config.experimentalCustomProjectionManualMatrix._14 },
                             { g_config.experimentalCustomProjectionManualMatrix._21, g_config.experimentalCustomProjectionManualMatrix._22, g_config.experimentalCustomProjectionManualMatrix._23, g_config.experimentalCustomProjectionManualMatrix._24 },
@@ -1907,15 +2272,15 @@ static void RenderImGuiOverlay() {
             }
 
             ImGui::Separator();
-            DrawMatrixWithTranspose("MVP", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
+            DrawMatrixWithTranspose("MVP", camSnapshot.mvp, camSnapshot.hasMVP,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_MVP, g_cameraMatrices.hasMVP);
-            DrawMatrixWithTranspose("VP", g_cameraMatrices.vp, g_cameraMatrices.hasVP,
+            DrawMatrixSourceInfo(MatrixSlot_MVP, camSnapshot.hasMVP);
+            DrawMatrixWithTranspose("VP", camSnapshot.vp, camSnapshot.hasVP,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_VP, g_cameraMatrices.hasVP);
-            DrawMatrixWithTranspose("WV", g_cameraMatrices.wv, g_cameraMatrices.hasWV,
+            DrawMatrixSourceInfo(MatrixSlot_VP, camSnapshot.hasVP);
+            DrawMatrixWithTranspose("WV", camSnapshot.wv, camSnapshot.hasWV,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_WV, g_cameraMatrices.hasWV);
+            DrawMatrixSourceInfo(MatrixSlot_WV, camSnapshot.hasWV);
 
             if (ImGui::CollapsingHeader("Combined MVP handling", ImGuiTreeNodeFlags_DefaultOpen)) {
                 if (ImGui::Checkbox("Enable Combined MVP", &g_config.enableCombinedMVP)) {
@@ -1974,6 +2339,7 @@ static void RenderImGuiOverlay() {
         }
 
         if (ImGui::BeginTabItem("Constants")) {
+            g_constantUploadRecordingEnabled = true;
             ImGui::Text("Per-shader snapshots update every frame.");
             if (g_selectedShaderKey == 0) {
                 if (g_activeShaderKey != 0) {
@@ -2064,11 +2430,11 @@ static void RenderImGuiOverlay() {
                                sizeof(editState->overrideConstants[g_selectedRegister]));
                         editState->overrideValid[g_selectedRegister] = true;
                         if (g_overrideScopeMode == Override_OneFrame) {
-                            editState->overrideFramesRemaining[g_selectedRegister] = 1;
+                            editState->overrideExpiresAtFrame[g_selectedRegister] = g_frameCount + 1;
                         } else if (g_overrideScopeMode == Override_NFrames) {
-                            editState->overrideFramesRemaining[g_selectedRegister] = g_overrideNFrames;
+                            editState->overrideExpiresAtFrame[g_selectedRegister] = g_frameCount + g_overrideNFrames;
                         } else {
-                            editState->overrideFramesRemaining[g_selectedRegister] = -1;
+                            editState->overrideExpiresAtFrame[g_selectedRegister] = -1;
                         }
                     }
                     ImGui::SameLine();
@@ -2347,14 +2713,14 @@ static void RenderImGuiOverlay() {
                         if (ImGui::Button("Use as View")) {
                             StoreViewMatrix(hit.matrix, 0, -1, 4, false, true, "memory scanner");
                             snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
-                                     "Assigned VIEW from memory scan @ 0x%p (hash 0x%08X).",
+                                     "Assigned VIEW from memory scan @ %p (hash 0x%08X).",
                                      reinterpret_cast<void*>(hit.address), hit.hash);
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("Use as Projection")) {
                             StoreProjectionMatrix(hit.matrix, 0, -1, 4, false, true, "memory scanner");
                             snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
-                                     "Assigned PROJECTION from memory scan @ 0x%p (hash 0x%08X).",
+                                     "Assigned PROJECTION from memory scan @ %p (hash 0x%08X).",
                                      reinterpret_cast<void*>(hit.address), hit.hash);
                         }
                         ImGui::PopID();
@@ -2463,12 +2829,18 @@ void LogMsg(const char* fmt, ...) {
 
 // Check if matrix values are valid
 bool LooksLikeMatrix(const float* data) {
-    float sum = 0;
+    float sum = 0.0f;
+    bool hasNearUnitValue = false;
     for (int i = 0; i < 16; i++) {
-        if (!std::isfinite(data[i])) return false;
-        sum += fabsf(data[i]);
+        const float v = data[i];
+        if (!std::isfinite(v)) return false;
+        const float a = fabsf(v);
+        if (a >= 1e5f) return false;
+        if (a > 0.5f && a < 2.0f) hasNearUnitValue = true;
+        sum += a;
     }
-    if (sum < 0.001f || sum > 10000.0f) return false;
+    if (!hasNearUnitValue) return false;
+    if (sum <= 0.5f || sum >= 5000.0f) return false;
     return true;
 }
 
@@ -2511,6 +2883,9 @@ static bool LooksLikeProjectionStrict(const D3DMATRIX& m) {
 static bool IsTypicalProjectionMatrix(const D3DMATRIX& m) {
     ProjectionAnalysis analysis = {};
     if (!AnalyzeProjectionMatrixNumeric(m, &analysis) || !analysis.valid) {
+        return false;
+    }
+    if (analysis.fovRadians < g_config.minFOV || analysis.fovRadians > g_config.maxFOV) {
         return false;
     }
 
@@ -2559,7 +2934,7 @@ static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysi
     }
 
     const float fov = 2.0f * atanf(1.0f / fabsf(m._22));
-    if (!std::isfinite(fov) || fov < g_config.minFOV || fov > g_config.maxFOV) {
+    if (!std::isfinite(fov) || fov < 0.01f || fov > 3.13f) {
         return false;
     }
 
@@ -2610,21 +2985,17 @@ static bool IsLikelyBoneTransform(const D3DMATRIX& m,
         return false;
     }
 
-    const float tx = m._41;
-    const float ty = m._42;
-    const float tz = m._43;
-    const float translationLen = sqrtf(tx * tx + ty * ty + tz * tz);
-
     const float r0 = sqrtf(Dot3(m._11, m._12, m._13, m._11, m._12, m._13));
     const float r1 = sqrtf(Dot3(m._21, m._22, m._23, m._21, m._22, m._23));
     const float r2 = sqrtf(Dot3(m._31, m._32, m._33, m._31, m._32, m._33));
     const bool nearUnitRows = fabsf(r0 - 1.0f) < 0.25f && fabsf(r1 - 1.0f) < 0.25f && fabsf(r2 - 1.0f) < 0.25f;
 
-    const bool appearsInLargePaletteUpload =
-        rows == 3 && vectorCountInUpload >= 12 && candidateBaseReg >= uploadStartReg &&
-        candidateBaseReg + 2 < uploadStartReg + vectorCountInUpload;
+    const bool appearsInPaletteUpload =
+        vectorCountInUpload >= 8 &&
+        candidateBaseReg >= uploadStartReg &&
+        (candidateBaseReg + static_cast<UINT>(rows)) <= (uploadStartReg + vectorCountInUpload);
 
-    return nearUnitRows && translationLen < 50.0f && appearsInLargePaletteUpload;
+    return nearUnitRows && appearsInPaletteUpload;
 }
 
 static bool LooksLikeWorldStrict(const D3DMATRIX& m,
@@ -2672,6 +3043,102 @@ static MatrixClassification ClassifyMatrixDeterministic(const D3DMATRIX& m,
     return MatrixClass_None;
 }
 
+static bool IsThreeRowPrefixOfPerspectiveMatrix(const float* data,
+                                                UINT startReg,
+                                                UINT vectorCount,
+                                                UINT candidateBaseReg,
+                                                bool transposedLayout);
+
+static int CountStridedCandidates(const float* data,
+                                  UINT startReg,
+                                  UINT vectorCount,
+                                  UINT strideRows,
+                                  MatrixClassification targetClass) {
+    int count = 0;
+    for (UINT offset = 0; offset + strideRows <= vectorCount; offset += strideRows) {
+        D3DMATRIX candidate = {};
+        if (!TryBuildMatrixFromConstantUpdate(data + offset * 4,
+                                              startReg + offset,
+                                              strideRows,
+                                              static_cast<int>(startReg + offset),
+                                              static_cast<int>(strideRows),
+                                              false,
+                                              &candidate)) {
+            continue;
+        }
+        MatrixClassification cls = ClassifyMatrixDeterministic(
+            candidate,
+            static_cast<int>(strideRows),
+            vectorCount,
+            startReg,
+            startReg + offset);
+
+        if (strideRows == 3u &&
+            (cls == MatrixClass_View || cls == MatrixClass_World) &&
+            IsThreeRowPrefixOfPerspectiveMatrix(data,
+                                                startReg,
+                                                vectorCount,
+                                                startReg + offset,
+                                                false)) {
+            continue;
+        }
+
+        if (cls == targetClass && ++count > 1) {
+            return count;
+        }
+    }
+    return count;
+}
+
+static bool IsThreeRowPrefixOfPerspectiveMatrix(const float* data,
+                                                UINT startReg,
+                                                UINT vectorCount,
+                                                UINT candidateBaseReg,
+                                                bool transposedLayout) {
+    if (!data || vectorCount < 4) {
+        return false;
+    }
+    if (candidateBaseReg < startReg) {
+        return false;
+    }
+
+    const UINT offset = candidateBaseReg - startReg;
+    if (offset + 4 > vectorCount) {
+        return false;
+    }
+
+    D3DMATRIX candidate4x4 = {};
+    if (!TryBuildMatrixFromConstantUpdate(data + offset * 4,
+                                          candidateBaseReg,
+                                          4u,
+                                          static_cast<int>(candidateBaseReg),
+                                          4,
+                                          transposedLayout,
+                                          &candidate4x4)) {
+        return false;
+    }
+
+    const MatrixClassification directClass = ClassifyMatrixDeterministic(
+        candidate4x4,
+        4,
+        vectorCount,
+        startReg,
+        candidateBaseReg);
+    if (directClass == MatrixClass_Projection || directClass == MatrixClass_CombinedPerspective) {
+        return true;
+    }
+
+    const D3DMATRIX transposed = TransposeMatrix(candidate4x4);
+    const MatrixClassification transposedClass = ClassifyMatrixDeterministic(
+        transposed,
+        4,
+        vectorCount,
+        startReg,
+        candidateBaseReg);
+    return transposedClass == MatrixClass_Projection ||
+           transposedClass == MatrixClass_CombinedPerspective;
+}
+
 static D3DMATRIX MultiplyMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     D3DMATRIX out = {};
     out._11 = a._11*b._11 + a._12*b._21 + a._13*b._31 + a._14*b._41;
@@ -2694,6 +3161,35 @@ static D3DMATRIX MultiplyMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     out._43 = a._41*b._13 + a._42*b._23 + a._43*b._33 + a._44*b._43;
     out._44 = a._41*b._14 + a._42*b._24 + a._43*b._34 + a._44*b._44;
     return out;
+}
+
+
+// Returns true if candidateView is consistent with being a pure orthonormal
+// view matrix relative to knownProjection.
+static bool CrossValidateViewAgainstProjection(const D3DMATRIX& candidateView,
+                                               const D3DMATRIX& knownProjection) {
+    D3DMATRIX vp = MultiplyMatrix(candidateView, knownProjection);
+
+    const float p_c0 = sqrtf(
+        knownProjection._11 * knownProjection._11 +
+        knownProjection._21 * knownProjection._21 +
+        knownProjection._31 * knownProjection._31);
+    const float p_c1 = sqrtf(
+        knownProjection._12 * knownProjection._12 +
+        knownProjection._22 * knownProjection._22 +
+        knownProjection._32 * knownProjection._32);
+    const float vp_c0 = sqrtf(
+        vp._11 * vp._11 + vp._21 * vp._21 + vp._31 * vp._31);
+    const float vp_c1 = sqrtf(
+        vp._12 * vp._12 + vp._22 * vp._22 + vp._32 * vp._32);
+
+    if (p_c0 < 1e-6f || p_c1 < 1e-6f) {
+        return true;
+    }
+
+    constexpr float kTol = 0.15f;
+    return (fabsf(vp_c0 - p_c0) / p_c0 < kTol) &&
+           (fabsf(vp_c1 - p_c1) / p_c1 < kTol);
 }
 
 static bool IsIdentityMatrix(const D3DMATRIX& m, float tolerance) {
@@ -2832,8 +3328,8 @@ static bool BuildExperimentalCustomProjectionMatrix(IDirect3DDevice9* device,
         return false;
     }
 
-    const int mode = g_config.experimentalCustomProjectionMode;
-    if (mode == 1) {
+    const CustomProjectionMode mode = g_config.experimentalCustomProjectionMode;
+    if (mode == CustomProjectionMode_Manual) {
         *outProjection = g_config.experimentalCustomProjectionManualMatrix;
         if (outUsedAuto) {
             *outUsedAuto = false;
@@ -2841,7 +3337,7 @@ static bool BuildExperimentalCustomProjectionMatrix(IDirect3DDevice9* device,
         return true;
     }
 
-    if (mode != 2) {
+    if (mode != CustomProjectionMode_Auto) {
         return false;
     }
 
@@ -2886,6 +3382,10 @@ static void OrthonormalizeViewMatrix(D3DMATRIX* view) {
         return;
     }
 
+    const float origTx = view->_41;
+    const float origTy = view->_42;
+    const float origTz = view->_43;
+
     float r0x = view->_11, r0y = view->_12, r0z = view->_13;
     float r1x = view->_21, r1y = view->_22, r1z = view->_23;
 
@@ -2911,10 +3411,15 @@ static void OrthonormalizeViewMatrix(D3DMATRIX* view) {
     view->_11 = r0x; view->_12 = r0y; view->_13 = r0z; view->_14 = 0.0f;
     view->_21 = r1x; view->_22 = r1y; view->_23 = r1z; view->_24 = 0.0f;
     view->_31 = r2x; view->_32 = r2y; view->_33 = r2z; view->_34 = 0.0f;
+    view->_41 = Dot3(origTx, origTy, origTz, view->_11, view->_12, view->_13);
+    view->_42 = Dot3(origTx, origTy, origTz, view->_21, view->_22, view->_23);
+    view->_43 = Dot3(origTx, origTy, origTz, view->_31, view->_32, view->_33);
     view->_44 = 1.0f;
 }
 
 static bool TryExtractProjectionFromCombined(const D3DMATRIX& combined,
+                                             const D3DMATRIX* worldOptional,
+                                             bool worldAvailable,
                                              ProjectionAnalysis* outAnalysis,
                                              D3DMATRIX* outProjection,
                                              bool forceDecomposition) {
@@ -2922,10 +3427,25 @@ static bool TryExtractProjectionFromCombined(const D3DMATRIX& combined,
         return false;
     }
 
-    const float sx = sqrtf(Dot3(combined._11, combined._12, combined._13,
-                                combined._11, combined._12, combined._13));
-    const float sy = sqrtf(Dot3(combined._21, combined._22, combined._23,
-                                combined._21, combined._22, combined._23));
+    D3DMATRIX extractionMatrix = combined;
+    if (worldAvailable && worldOptional) {
+        D3DMATRIX worldInv = {};
+        if (!InvertMatrix4x4Deterministic(*worldOptional, &worldInv, nullptr)) {
+            return false;
+        }
+        extractionMatrix = MultiplyMatrix(worldInv, combined);
+    } else if (!IsTypicalProjectionMatrix(combined)) {
+        return false;
+    }
+
+    if (!IsTypicalProjectionMatrix(extractionMatrix)) {
+        return false;
+    }
+
+    const float sx = sqrtf(Dot3(extractionMatrix._11, extractionMatrix._12, extractionMatrix._13,
+                                extractionMatrix._11, extractionMatrix._12, extractionMatrix._13));
+    const float sy = sqrtf(Dot3(extractionMatrix._21, extractionMatrix._22, extractionMatrix._23,
+                                extractionMatrix._21, extractionMatrix._22, extractionMatrix._23));
     if (!std::isfinite(sx) || !std::isfinite(sy) || sx < 1e-5f || sy < 1e-5f) {
         return false;
     }
@@ -2933,22 +3453,24 @@ static bool TryExtractProjectionFromCombined(const D3DMATRIX& combined,
     const float fov = 2.0f * atanf(1.0f / sy);
     const float aspect = sy / sx;
     if (!forceDecomposition) {
-        if (!std::isfinite(fov) || fov < g_config.minFOV || fov > g_config.maxFOV) {
+        if (!std::isfinite(fov) || fov < 0.01f || fov > 3.13f) {
             return false;
         }
     }
 
-    const float det = Determinant3x3(combined);
+    const float det = Determinant3x3(extractionMatrix);
     ProjectionHandedness handedness = ProjectionHandedness_Unknown;
     if (std::isfinite(det)) {
         handedness = (det < 0.0f) ? ProjectionHandedness_Right : ProjectionHandedness_Left;
     }
 
+    const float nearZ = (std::max)(0.0001f, g_config.experimentalCustomProjectionAutoNearZ);
+    const float farZ = (std::max)(nearZ + 0.001f, g_config.experimentalCustomProjectionAutoFarZ);
     CreateProjectionMatrixWithHandedness(outProjection,
                                          fov,
                                          (std::max)(0.1f, aspect),
-                                         0.1f,
-                                         1000.0f,
+                                         nearZ,
+                                         farZ,
                                          handedness);
 
     if (outAnalysis) {
@@ -2987,7 +3509,7 @@ static bool TryDecomposeCombinedMVP(const D3DMATRIX& mvp,
 
     ProjectionAnalysis analysis = {};
     D3DMATRIX projection = {};
-    if (!TryExtractProjectionFromCombined(viewProjection, &analysis, &projection, g_config.combinedMVPForceDecomposition)) {
+    if (!TryExtractProjectionFromCombined(viewProjection, worldOptional, worldAvailable, &analysis, &projection, g_config.combinedMVPForceDecomposition)) {
         return false;
     }
 
@@ -3058,12 +3580,38 @@ bool LooksLikeView(const D3DMATRIX& m) {
 class WrappedD3D9Device;
 class WrappedD3D9;
 
+class WrappedVertexShader9 : public IDirect3DVertexShader9 {
+private:
+    IDirect3DVertexShader9* m_real;
+    uintptr_t m_key;
+public:
+    explicit WrappedVertexShader9(IDirect3DVertexShader9* real)
+        : m_real(real), m_key(reinterpret_cast<uintptr_t>(this)) {}
+
+    IDirect3DVertexShader9* GetReal() const { return m_real; }
+    uintptr_t GetKey() const { return m_key; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override { return m_real->QueryInterface(riid, ppv); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG count = m_real->Release();
+        if (count == 0) {
+            OnVertexShaderReleased(m_key);
+            delete this;
+        }
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9** ppDevice) override { return m_real->GetDevice(ppDevice); }
+    HRESULT STDMETHODCALLTYPE GetFunction(void* pData, UINT* pSizeOfData) override { return m_real->GetFunction(pData, pSizeOfData); }
+};
+
 /**
  * Wrapped IDirect3DDevice9 - intercepts SetVertexShaderConstantF
  */
-class WrappedD3D9Device : public IDirect3DDevice9 {
+class WrappedD3D9Device : public IDirect3DDevice9Ex {
 private:
     IDirect3DDevice9* m_real;
+    IDirect3DDevice9Ex* m_realEx = nullptr;
     D3DMATRIX m_currentView;
     D3DMATRIX m_currentProj;
     D3DMATRIX m_currentWorld;
@@ -3075,12 +3623,24 @@ private:
     bool m_hasWorld = false;
     bool m_mgrrUseAutoProjection = false;
     int m_constantLogThrottle = 0;
+    int m_viewLastFrame = -1;
+    int m_projLastFrame = -1;
+    int m_projDetectedFrame = -1;
+    int m_worldLastFrame = -1;
+    uintptr_t m_viewLockedShader = 0;
+    int m_viewLockedRegister = -1;
+    uintptr_t m_projLockedShader = 0;
+    int m_projLockedRegister = -1;
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
+        if (m_real) {
+            m_real->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&m_realEx));
+        }
         CreateIdentityMatrix(&m_currentView);
         CreateIdentityMatrix(&m_currentProj);
         CreateIdentityMatrix(&m_currentWorld);
+        m_projDetectedFrame = -1;
         m_mgrrUseAutoProjection = g_config.mgrrUseAutoProjectionWhenC4Invalid;
         D3DDEVICE_CREATION_PARAMETERS params = {};
         if (SUCCEEDED(m_real->GetCreationParameters(&params))) {
@@ -3093,11 +3653,18 @@ public:
     }
 
     ~WrappedD3D9Device() {
+        if (m_realEx) {
+            m_realEx->Release();
+            m_realEx = nullptr;
+        }
         LogMsg("WrappedD3D9Device destroyed");
     }
 
     void EmitFixedFunctionTransforms() {
         if (!g_config.emitFixedFunctionTransforms) {
+            return;
+        }
+        if (g_config.setTransformBypassProxyWhenGameProvides && g_gameSetTransformAnySeen) {
             return;
         }
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
@@ -3112,7 +3679,22 @@ public:
                 return;
             }
 
-            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
+            D3DMATRIX worldToEmit = m_currentWorld;
+            g_lastInverseViewAsWorldEligible = false;
+            g_lastInverseViewAsWorldApplied = false;
+            g_lastInverseViewAsWorldUsedFast = false;
+            if (g_config.experimentalInverseViewAsWorld) {
+                const bool viewLooksValid = LooksLikeViewStrict(m_currentView);
+                g_lastInverseViewAsWorldEligible = viewLooksValid;
+                if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
+                    if (TryBuildWorldFromView(m_currentView, g_config.experimentalInverseViewAsWorldFast,
+                                              &worldToEmit, &g_lastInverseViewAsWorldUsedFast, nullptr)) {
+                        g_lastInverseViewAsWorldApplied = true;
+                    }
+                }
+            }
+
+            m_real->SetTransform(D3DTS_WORLD, &worldToEmit);
             m_real->SetTransform(D3DTS_VIEW, &m_currentView);
             m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
             return;
@@ -3128,7 +3710,22 @@ public:
                 return;
             }
 
-            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
+            D3DMATRIX worldToEmit = m_currentWorld;
+            g_lastInverseViewAsWorldEligible = false;
+            g_lastInverseViewAsWorldApplied = false;
+            g_lastInverseViewAsWorldUsedFast = false;
+            if (g_config.experimentalInverseViewAsWorld) {
+                const bool viewLooksValid = LooksLikeViewStrict(m_currentView);
+                g_lastInverseViewAsWorldEligible = viewLooksValid;
+                if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
+                    if (TryBuildWorldFromView(m_currentView, g_config.experimentalInverseViewAsWorldFast,
+                                              &worldToEmit, &g_lastInverseViewAsWorldUsedFast, nullptr)) {
+                        g_lastInverseViewAsWorldApplied = true;
+                    }
+                }
+            }
+
+            m_real->SetTransform(D3DTS_WORLD, &worldToEmit);
             m_real->SetTransform(D3DTS_VIEW, &m_currentView);
             m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
             return;
@@ -3145,7 +3742,22 @@ public:
                 return;
             }
 
-            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
+            D3DMATRIX worldToEmit = m_currentWorld;
+            g_lastInverseViewAsWorldEligible = false;
+            g_lastInverseViewAsWorldApplied = false;
+            g_lastInverseViewAsWorldUsedFast = false;
+            if (g_config.experimentalInverseViewAsWorld && m_hasView) {
+                const bool viewLooksValid = LooksLikeViewStrict(m_currentView);
+                g_lastInverseViewAsWorldEligible = viewLooksValid;
+                if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
+                    if (TryBuildWorldFromView(m_currentView, g_config.experimentalInverseViewAsWorldFast,
+                                              &worldToEmit, &g_lastInverseViewAsWorldUsedFast, nullptr)) {
+                        g_lastInverseViewAsWorldApplied = true;
+                    }
+                }
+            }
+
+            m_real->SetTransform(D3DTS_WORLD, &worldToEmit);
             if (useGameViewProj) {
                 m_real->SetTransform(D3DTS_VIEW, &m_currentView);
                 m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
@@ -3157,7 +3769,9 @@ public:
         if (g_config.experimentalCustomProjectionEnabled) {
             const bool projectionMissing = !m_hasProj;
             const bool projectionOverrideAllowed = g_config.experimentalCustomProjectionOverrideDetectedProjection;
-            const bool mvpBlocksProjection = g_cameraMatrices.hasMVP && !g_config.experimentalCustomProjectionOverrideCombinedMVP;
+            bool hasMvp = false;
+            { std::lock_guard<std::mutex> lock(g_cameraMatricesMutex); hasMvp = g_cameraMatrices.hasMVP; }
+            const bool mvpBlocksProjection = hasMvp && !g_config.experimentalCustomProjectionOverrideCombinedMVP;
             shouldApplyCustomProjection = (projectionMissing || projectionOverrideAllowed) && !mvpBlocksProjection;
         }
 
@@ -3172,6 +3786,7 @@ public:
                                                         &width, &height)) {
                 m_currentProj = customProjection;
                 m_hasProj = true;
+                m_projLastFrame = g_frameCount;
                 g_projectionDetectedByNumericStructure = false;
                 g_projectionDetectedRegister = -1;
                 g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
@@ -3196,20 +3811,69 @@ public:
 
         D3DMATRIX identity = {};
         CreateIdentityMatrix(&identity);
-        if (!m_hasWorld) m_currentWorld = identity;
-        if (!m_hasView) m_currentView = identity;
-        if (!m_hasProj) m_currentProj = identity;
-        m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
-        m_real->SetTransform(D3DTS_VIEW, &m_currentView);
-        m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
+        D3DMATRIX emitWorld = m_currentWorld;
+        D3DMATRIX emitView = m_currentView;
+        D3DMATRIX emitProj = m_currentProj;
+
+        if (!m_hasWorld) emitWorld = identity;
+        if (!m_hasView) emitView = identity;
+        if (!m_hasProj) emitProj = identity;
+
+        if (m_worldLastFrame >= 0 && g_frameCount > m_worldLastFrame + 1) {
+            LogMsg("World matrix stale (last update frame %d, current %d); emitting identity.", m_worldLastFrame, g_frameCount);
+            emitWorld = identity;
+        }
+        if (m_viewLastFrame >= 0 && g_frameCount > m_viewLastFrame + 1) {
+            LogMsg("View matrix stale (last update frame %d, current %d); emitting identity.", m_viewLastFrame, g_frameCount);
+            emitView = identity;
+        }
+        if (m_projLastFrame >= 0 && g_frameCount > m_projLastFrame + 1) {
+            LogMsg("Projection matrix stale (last update frame %d, current %d); emitting identity.", m_projLastFrame, g_frameCount);
+            emitProj = identity;
+        }
+
+        g_lastInverseViewAsWorldEligible = false;
+        g_lastInverseViewAsWorldApplied = false;
+        g_lastInverseViewAsWorldUsedFast = false;
+        if (g_config.experimentalInverseViewAsWorld && m_hasView) {
+            const bool viewLooksValid = LooksLikeViewStrict(emitView);
+            g_lastInverseViewAsWorldEligible = viewLooksValid;
+            if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
+                D3DMATRIX derivedWorld = {};
+                bool usedFastInverse = false;
+                bool fastEligible = false;
+                if (TryBuildWorldFromView(emitView, g_config.experimentalInverseViewAsWorldFast,
+                                          &derivedWorld, &usedFastInverse, &fastEligible)) {
+                    emitWorld = derivedWorld;
+                    g_lastInverseViewAsWorldApplied = true;
+                    g_lastInverseViewAsWorldUsedFast = usedFastInverse;
+                    if (!fastEligible && g_config.experimentalInverseViewAsWorldFast) {
+                        LogMsg("Fast inverse requested but view matrix did not qualify (possible scaling/shear); used full inverse.");
+                    }
+                }
+            }
+        }
+
+        m_real->SetTransform(D3DTS_WORLD, &emitWorld);
+        m_real->SetTransform(D3DTS_VIEW, &emitView);
+        m_real->SetTransform(D3DTS_PROJECTION, &emitProj);
     }
 
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
-        HRESULT hr = m_real->QueryInterface(riid, ppvObj);
-        // Don't wrap QueryInterface results - could cause issues
-        return hr;
+        if (!ppvObj) return E_POINTER;
+        if (riid == IID_IUnknown || riid == __uuidof(IDirect3DDevice9)) {
+            *ppvObj = static_cast<IDirect3DDevice9*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == __uuidof(IDirect3DDevice9Ex) && m_realEx) {
+            *ppvObj = static_cast<IDirect3DDevice9Ex*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return m_real->QueryInterface(riid, ppvObj);
     }
 
     ULONG STDMETHODCALLTYPE AddRef() override {
@@ -3232,7 +3896,9 @@ public:
         UINT Vector4fCount) override
     {
         uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
-        RecordConstantUpload(ConstantUploadStage_Vertex, shaderKey, StartRegister, Vector4fCount);
+        if (g_constantUploadRecordingEnabled) {
+            RecordConstantUpload(ConstantUploadStage_Vertex, shaderKey, StartRegister, Vector4fCount);
+        }
         ShaderConstantState* state = GetShaderState(shaderKey, true);
         const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
         const bool profileIsBarnyard = g_activeGameProfile == GameProfile_Barnyard;
@@ -3290,14 +3956,17 @@ public:
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = manualMat;
                     m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = manualMat;
                     m_hasView = true;
+                m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = manualMat;
                     m_hasProj = true;
+                m_projLastFrame = g_frameCount;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = binding.baseRegister;
                     g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
@@ -3345,6 +4014,7 @@ public:
                 g_mgrProjectionRegisterValid = IsTypicalProjectionMatrix(mat);
                 m_currentProj = mat;
                 m_hasProj = true;
+                m_projLastFrame = g_frameCount;
                 g_mgrProjCapturedThisFrame = true;
                 if (g_mgrProjectionRegisterValid) {
                     g_projectionDetectedByNumericStructure = false;
@@ -3381,12 +4051,15 @@ public:
                     ProjectionAnalysis generatedProjectionInfo = {};
                     D3DMATRIX generatedProjection = {};
                     if (TryExtractProjectionFromCombined(mat,
+                                                         nullptr,
+                                                         false,
                                                          &generatedProjectionInfo,
                                                          &generatedProjection,
                                                          g_config.combinedMVPForceDecomposition)) {
                         resolvedProjection = generatedProjection;
                         m_currentProj = generatedProjection;
                         m_hasProj = true;
+                m_projLastFrame = g_frameCount;
                         g_mgrProjCapturedThisFrame = true;
                         g_projectionDetectedByNumericStructure = true;
                         g_projectionDetectedRegister = 8;
@@ -3405,6 +4078,7 @@ public:
                         OrthonormalizeViewMatrix(&derivedView);
                         m_currentView = derivedView;
                         m_hasView = true;
+                m_viewLastFrame = g_frameCount;
                         g_mgrViewCapturedThisFrame = true;
                         g_profileViewDerivedFromInverse = true;
                         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
@@ -3426,6 +4100,7 @@ public:
             if (tryExtractMgrMatrix(16, &mat)) {
                 m_currentWorld = mat;
                 m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
                 g_mgrWorldCapturedForDraw = true;
                 g_profileCoreRegistersSeen[2] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, 16, 4, false, true,
@@ -3444,6 +4119,7 @@ public:
                                                  0, 4, false, &mat)) {
                 m_currentWorld = mat;
                 m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
                 worldCaptured = true;
                 g_profileCoreRegistersSeen[2] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, 0, 4, false, true,
@@ -3455,6 +4131,7 @@ public:
                                                  g_config.worldMatrixRegister, 4, false, &mat)) {
                 m_currentWorld = mat;
                 m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
                 worldCaptured = true;
                 g_profileCoreRegistersSeen[2] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, g_config.worldMatrixRegister, 4, false, true,
@@ -3490,6 +4167,7 @@ public:
                         if (cls == MatrixClass_World) {
                             m_currentWorld = candidate;
                             m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
                             worldCaptured = true;
                             g_profileCoreRegistersSeen[2] = true;
                             StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg),
@@ -3530,12 +4208,11 @@ public:
 
             if (tryExtractProfileMatrix(g_profileLayout.combinedMvpBase, &mat)) {
                 anyCaptured = true;
-                g_cameraMatrices.mvp = mat;
-                g_cameraMatrices.hasMVP = true;
-                UpdateMatrixSource(MatrixSlot_MVP, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
-                                   "DevilMayCry4 profile combined MVP (c0-c3)");
+                StoreMVPMatrix(mat, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
+                               "DevilMayCry4 profile combined MVP (c0-c3)");
                 m_currentWorld = mat;
                 m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_World] = true;
                 g_profileCoreRegistersSeen[0] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, g_profileLayout.worldBase, 4, false, true,
@@ -3546,6 +4223,7 @@ public:
                 anyCaptured = true;
                 m_currentView = mat;
                 m_hasView = true;
+                m_viewLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_View] = true;
                 g_profileCoreRegistersSeen[1] = true;
                 g_profileViewDerivedFromInverse = false;
@@ -3557,6 +4235,7 @@ public:
                 anyCaptured = true;
                 m_currentProj = mat;
                 m_hasProj = true;
+                m_projLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_Projection] = true;
                 g_projectionDetectedByNumericStructure = false;
                 g_projectionDetectedRegister = g_profileLayout.projectionBase;
@@ -3599,16 +4278,19 @@ public:
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = mat;
                     m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                      "explicit register override");
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = mat;
                     m_hasView = true;
+                m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                     "explicit register override");
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = mat;
                     m_hasProj = true;
+                m_projLastFrame = g_frameCount;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = configuredRegister;
                     g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
@@ -3685,8 +4367,12 @@ public:
             m_currentView = decompView;
             m_currentProj = decompProj;
             m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
             m_hasView = true;
+                m_viewLastFrame = g_frameCount;
             m_hasProj = true;
+            m_projLastFrame = g_frameCount;
+            m_projDetectedFrame = g_frameCount;
             slotResolvedStructurally[MatrixSlot_World] = true;
             slotResolvedStructurally[MatrixSlot_View] = true;
             slotResolvedStructurally[MatrixSlot_Projection] = true;
@@ -3714,40 +4400,86 @@ public:
             }
         };
 
+        bool suppressViewFromUpload = false;
+        bool suppressWorldFromUpload = false;
+
         auto updateFromClassification = [&](D3DMATRIX mat, UINT baseReg, int rows, bool transposed) {
             MatrixClassification cls = ClassifyMatrixDeterministic(mat, rows, Vector4fCount, StartRegister, baseReg);
 
-            if (cls == MatrixClass_Projection && g_config.projMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_Projection]) {
+            if (cls == MatrixClass_Projection &&
+                g_config.projMatrixRegister < 0 &&
+                !slotResolvedByOverride[MatrixSlot_Projection] &&
+                !slotResolvedStructurally[MatrixSlot_Projection]) {
                 ProjectionAnalysis projectionInfo = {};
-                if (!AnalyzeProjectionMatrixNumeric(mat, &projectionInfo)) {
-                    return;
+                if (!AnalyzeProjectionMatrixNumeric(mat, &projectionInfo)) return;
+                if (projectionInfo.fovRadians < g_config.minFOV ||
+                    projectionInfo.fovRadians > g_config.maxFOV) return;
+
+                const bool sameSource =
+                    (m_projLockedShader == 0) ||
+                    (shaderKey == m_projLockedShader &&
+                     static_cast<int>(baseReg) == m_projLockedRegister);
+                if (sameSource) {
+                    m_projLockedShader = shaderKey;
+                    m_projLockedRegister = static_cast<int>(baseReg);
+                    m_currentProj = mat;
+                    m_hasProj = true;
+                    m_projLastFrame = g_frameCount;
+                    m_projDetectedFrame = g_frameCount;
+                    slotResolvedStructurally[MatrixSlot_Projection] = true;
+                    g_projectionDetectedByNumericStructure = true;
+                    g_projectionDetectedFovRadians = projectionInfo.fovRadians;
+                    g_projectionDetectedRegister = static_cast<int>(baseReg);
+                    g_projectionDetectedHandedness = projectionInfo.handedness;
+                    StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg),
+                                          rows, transposed, false,
+                                          "deterministic structural projection");
+                    LogMsg("Projection accepted: c%d-c%d rows=%d fov=%.2f deg (%s)",
+                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1, rows,
+                           projectionInfo.fovRadians * 180.0f / 3.14159265f,
+                           ProjectionHandednessLabel(projectionInfo.handedness));
                 }
-                m_currentProj = mat;
-                m_hasProj = true;
-                slotResolvedStructurally[MatrixSlot_Projection] = true;
-                g_projectionDetectedByNumericStructure = true;
-                g_projectionDetectedFovRadians = projectionInfo.fovRadians;
-                g_projectionDetectedRegister = static_cast<int>(baseReg);
-                g_projectionDetectedHandedness = projectionInfo.handedness;
-                StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural projection");
-                LogMsg("Projection accepted via numeric structure: c%d-c%d rows=%d transpose=%d fov=%.2f deg (%s)",
-                       static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1,
-                       rows, transposed ? 1 : 0,
-                       projectionInfo.fovRadians * 180.0f / 3.14159265f,
-                       ProjectionHandednessLabel(projectionInfo.handedness));
-            } else if (cls == MatrixClass_View && g_config.viewMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_View]) {
-                m_currentView = mat;
-                m_hasView = true;
-                slotResolvedStructurally[MatrixSlot_View] = true;
-                StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural view");
-            } else if (cls == MatrixClass_World && g_config.worldMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_World]) {
+            } else if (cls == MatrixClass_View &&
+                       !suppressViewFromUpload &&
+                       g_config.viewMatrixRegister < 0 &&
+                       !slotResolvedByOverride[MatrixSlot_View] &&
+                       !slotResolvedStructurally[MatrixSlot_View]) {
+                const bool sameSource =
+                    (m_viewLockedShader == 0) ||
+                    (shaderKey == m_viewLockedShader &&
+                     static_cast<int>(baseReg) == m_viewLockedRegister);
+                if (sameSource) {
+                    if (m_hasProj && m_projDetectedFrame == g_frameCount &&
+                        !CrossValidateViewAgainstProjection(mat, m_currentProj)) {
+                        // Column norms of candidateView * P do not match column norms of P.
+                        // This is WV, VP, or some other combined form — not a pure view matrix.
+                        // Do not mark slotResolvedStructurally so detection can continue.
+                        return;
+                    }
+                    m_viewLockedShader = shaderKey;
+                    m_viewLockedRegister = static_cast<int>(baseReg);
+                    m_currentView = mat;
+                    m_hasView = true;
+                    m_viewLastFrame = g_frameCount;
+                    slotResolvedStructurally[MatrixSlot_View] = true;
+                    StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg),
+                                    rows, transposed, false,
+                                    "deterministic structural view");
+                }
+            } else if (cls == MatrixClass_World &&
+                       !suppressWorldFromUpload &&
+                       g_config.worldMatrixRegister < 0 &&
+                       !slotResolvedByOverride[MatrixSlot_World] &&
+                       !slotResolvedStructurally[MatrixSlot_World]) {
                 m_currentWorld = mat;
                 m_hasWorld = true;
+                m_worldLastFrame = g_frameCount;
                 slotResolvedStructurally[MatrixSlot_World] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural world");
             } else if (cls == MatrixClass_CombinedPerspective &&
                        g_config.worldMatrixRegister < 0 && g_config.viewMatrixRegister < 0 && g_config.projMatrixRegister < 0 &&
                        !slotResolvedByOverride[MatrixSlot_World] && !slotResolvedByOverride[MatrixSlot_View] && !slotResolvedByOverride[MatrixSlot_Projection] &&
+                       !slotResolvedStructurally[MatrixSlot_World] && !slotResolvedStructurally[MatrixSlot_View] && !slotResolvedStructurally[MatrixSlot_Projection] &&
                        rows == 4) {
                 tryHandleCombinedMVP(mat, baseReg, rows, transposed);
             }
@@ -3755,6 +4487,27 @@ public:
 
         g_profileDisableStructuralDetection = false;
         const bool allowStructuralDetection = !profileActive;
+
+        if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 12) {
+            if (CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 4u, MatrixClass_View) > 2) {
+                suppressViewFromUpload = true;
+            }
+            if (CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 4u, MatrixClass_World) > 2) {
+                suppressWorldFromUpload = true;
+            }
+            if (!suppressViewFromUpload &&
+                CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 3u, MatrixClass_View) > 2) {
+                suppressViewFromUpload = true;
+            }
+            if (!suppressWorldFromUpload &&
+                CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 3u, MatrixClass_World) > 2) {
+                suppressWorldFromUpload = true;
+            }
+        }
 
         bool anyStructuralMatch = false;
         if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 3) {
@@ -3783,21 +4536,49 @@ public:
                     }
 
                     MatrixClassification finalClass = ClassifyMatrixDeterministic(mat, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                    if (rows == 3u &&
+                        (finalClass == MatrixClass_View || finalClass == MatrixClass_World) &&
+                        IsThreeRowPrefixOfPerspectiveMatrix(effectiveConstantData,
+                                                            StartRegister,
+                                                            Vector4fCount,
+                                                            baseReg,
+                                                            transposed)) {
+                        finalClass = MatrixClass_None;
+                    }
                     if (finalClass == MatrixClass_None && g_probeInverseView && rows == 4u) {
-                        D3DMATRIX inverseView = InvertSimpleRigidView(mat);
-                        MatrixClassification inverseClass = ClassifyMatrixDeterministic(inverseView, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
-                        if (inverseClass == MatrixClass_View) {
-                            mat = inverseView;
-                            finalClass = inverseClass;
+                        const float row0Len = sqrtf(Dot3(mat._11, mat._12, mat._13, mat._11, mat._12, mat._13));
+                        const float row1Len = sqrtf(Dot3(mat._21, mat._22, mat._23, mat._21, mat._22, mat._23));
+                        const float row2Len = sqrtf(Dot3(mat._31, mat._32, mat._33, mat._31, mat._32, mat._33));
+                        const bool orthonormal =
+                            fabsf(row0Len - 1.0f) < 0.05f &&
+                            fabsf(row1Len - 1.0f) < 0.05f &&
+                            fabsf(row2Len - 1.0f) < 0.05f &&
+                            fabsf(Dot3(mat._11, mat._12, mat._13, mat._21, mat._22, mat._23)) < 0.05f &&
+                            fabsf(Dot3(mat._11, mat._12, mat._13, mat._31, mat._32, mat._33)) < 0.05f &&
+                            fabsf(Dot3(mat._21, mat._22, mat._23, mat._31, mat._32, mat._33)) < 0.05f;
+                        if (orthonormal) {
+                            D3DMATRIX inverseView = InvertSimpleRigidView(mat);
+                            MatrixClassification inverseClass = ClassifyMatrixDeterministic(inverseView, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                            if (inverseClass == MatrixClass_View) {
+                                mat = inverseView;
+                                finalClass = inverseClass;
+                            }
                         }
                     }
                     if (finalClass != MatrixClass_None) {
                         anyStructuralMatch = true;
                         updateFromClassification(mat, baseReg, static_cast<int>(rows), transposed);
                     }
+
+                    const bool allSlotsResolved =
+                        (slotResolvedStructurally[MatrixSlot_View] || slotResolvedByOverride[MatrixSlot_View] || g_config.viewMatrixRegister >= 0) &&
+                        (slotResolvedStructurally[MatrixSlot_Projection] || slotResolvedByOverride[MatrixSlot_Projection] || g_config.projMatrixRegister >= 0) &&
+                        (slotResolvedStructurally[MatrixSlot_World] || slotResolvedByOverride[MatrixSlot_World] || g_config.worldMatrixRegister >= 0);
+                    if (allSlotsResolved) goto done_scanning;
                 }
             }
         }
+        done_scanning:
 
         if (g_config.logAllConstants && m_constantLogThrottle == 0 && Vector4fCount >= 4) {
             LogMsg("SetVertexShaderConstantF: c%d-%d (%d vectors)",
@@ -3817,6 +4598,17 @@ public:
     HRESULT STDMETHODCALLTYPE Present(const RECT* pSourceRect, const RECT* pDestRect,
                                        HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) override {
         g_frameCount++;
+
+        // Reset per-frame source locks. Locks set during SetVertexShaderConstantF calls
+        // this frame will be validated against these — after Present they reset for the
+        // next frame. This ensures correct behavior regardless of BeginScene call count.
+        if (g_activeGameProfile == GameProfile_None) {
+            m_viewLockedShader = 0;
+            m_viewLockedRegister = -1;
+            m_projLockedShader = 0;
+            m_projLockedRegister = -1;
+        }
+
         UpdateFrameTimeStats();
         // Throttle constant logging to every 60 frames
         if (g_config.logAllConstants) {
@@ -3883,6 +4675,7 @@ public:
     HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) override {
         if (g_imguiInitialized) {
             ImGui_ImplDX9_InvalidateDeviceObjects();
+            // Do NOT call ImGui_ImplWin32_Shutdown here.
         }
         HRESULT hr = m_real->Reset(pPresentationParameters);
         if (SUCCEEDED(hr) && g_imguiInitialized) {
@@ -3924,12 +4717,80 @@ public:
             g_mgrProjCapturedThisFrame = false;
             g_mgrViewCapturedThisFrame = false;
             g_mgrProjectionRegisterValid = false;
+        } else if (g_activeGameProfile == GameProfile_None) {
+            m_viewLockedShader = 0;
+            m_viewLockedRegister = -1;
+            m_projLockedShader = 0;
+            m_projLockedRegister = -1;
         }
         return m_real->BeginScene();
     }
     HRESULT STDMETHODCALLTYPE EndScene() override { return m_real->EndScene(); }
     HRESULT STDMETHODCALLTYPE Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) override { return m_real->Clear(Count, pRects, Flags, Color, Z, Stencil); }
     HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override {
+        int transformIdx = -1;
+        if (State == D3DTS_WORLD) transformIdx = 0;
+        if (State == D3DTS_VIEW) transformIdx = 1;
+        if (State == D3DTS_PROJECTION) transformIdx = 2;
+        if (transformIdx >= 0 && pMatrix) {
+            g_gameSetTransformSeen[transformIdx] = true;
+            g_gameSetTransformAnySeen = true;
+
+            if (g_config.setTransformBypassProxyWhenGameProvides) {
+                if (State == D3DTS_WORLD) {
+                    m_currentWorld = *pMatrix;
+                    m_hasWorld = true;
+                    m_worldLastFrame = g_frameCount;
+                    StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
+                                     "game SetTransform(World) direct passthrough");
+                } else if (State == D3DTS_VIEW) {
+                    m_currentView = *pMatrix;
+                    m_hasView = true;
+                    m_viewLastFrame = g_frameCount;
+                    StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
+                                    "game SetTransform(View) direct passthrough");
+                } else if (State == D3DTS_PROJECTION) {
+                    m_currentProj = *pMatrix;
+                    m_hasProj = true;
+                    m_projLastFrame = g_frameCount;
+                    StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                          "game SetTransform(Projection) direct passthrough");
+                }
+                return m_real->SetTransform(State, pMatrix);
+            }
+
+            if (g_config.setTransformRoundTripCompatibilityMode) {
+                const HRESULT setHr = m_real->SetTransform(State, pMatrix);
+                if (FAILED(setHr)) {
+                    return setHr;
+                }
+                D3DMATRIX roundTrip = *pMatrix;
+                if (SUCCEEDED(m_real->GetTransform(State, &roundTrip))) {
+                    m_real->SetTransform(State, &roundTrip);
+                }
+                if (State == D3DTS_WORLD) {
+                    m_currentWorld = roundTrip;
+                    m_hasWorld = true;
+                    m_worldLastFrame = g_frameCount;
+                    StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
+                                     "game SetTransform(World)+GetTransform compatibility");
+                } else if (State == D3DTS_VIEW) {
+                    m_currentView = roundTrip;
+                    m_hasView = true;
+                    m_viewLastFrame = g_frameCount;
+                    StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
+                                    "game SetTransform(View)+GetTransform compatibility");
+                } else if (State == D3DTS_PROJECTION) {
+                    m_currentProj = roundTrip;
+                    m_hasProj = true;
+                    m_projLastFrame = g_frameCount;
+                    StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                          "game SetTransform(Projection)+GetTransform compatibility");
+                }
+                return setHr;
+            }
+        }
+
         if (g_activeGameProfile == GameProfile_Barnyard &&
             (State == D3DTS_VIEW || State == D3DTS_PROJECTION)) {
             if (!g_config.barnyardUseGameSetTransformsForViewProjection || !pMatrix) {
@@ -3947,6 +4808,7 @@ public:
             if (State == D3DTS_VIEW) {
                 m_currentView = captured;
                 m_hasView = true;
+                m_viewLastFrame = g_frameCount;
                 g_profileCoreRegistersSeen[0] = true;
                 StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
                                 SUCCEEDED(getHr)
@@ -3955,6 +4817,7 @@ public:
             } else {
                 m_currentProj = captured;
                 m_hasProj = true;
+                m_projLastFrame = g_frameCount;
                 g_profileCoreRegistersSeen[1] = true;
                 g_projectionDetectedByNumericStructure = false;
                 g_projectionDetectedRegister = -1;
@@ -4043,20 +4906,35 @@ public:
     HRESULT STDMETHODCALLTYPE GetVertexDeclaration(IDirect3DVertexDeclaration9** ppDecl) override { return m_real->GetVertexDeclaration(ppDecl); }
     HRESULT STDMETHODCALLTYPE SetFVF(DWORD FVF) override { return m_real->SetFVF(FVF); }
     HRESULT STDMETHODCALLTYPE GetFVF(DWORD* pFVF) override { return m_real->GetFVF(pFVF); }
-    HRESULT STDMETHODCALLTYPE CreateVertexShader(const DWORD* pFunction, IDirect3DVertexShader9** ppShader) override { return m_real->CreateVertexShader(pFunction, ppShader); }
+    HRESULT STDMETHODCALLTYPE CreateVertexShader(const DWORD* pFunction, IDirect3DVertexShader9** ppShader) override {
+        if (!ppShader) {
+            return D3DERR_INVALIDCALL;
+        }
+        IDirect3DVertexShader9* realShader = nullptr;
+        HRESULT hr = m_real->CreateVertexShader(pFunction, &realShader);
+        if (FAILED(hr) || !realShader) {
+            *ppShader = nullptr;
+            return hr;
+        }
+        *ppShader = new WrappedVertexShader9(realShader);
+        return hr;
+    }
     HRESULT STDMETHODCALLTYPE SetVertexShader(IDirect3DVertexShader9* pShader) override {
         m_currentVertexShader = pShader;
         g_activeShaderKey = reinterpret_cast<uintptr_t>(pShader);
         GetShaderState(g_activeShaderKey, true);
 
+        IDirect3DVertexShader9* realShader = nullptr;
         if (pShader) {
-            uint32_t shaderHash = ComputeShaderBytecodeHash(pShader);
+            WrappedVertexShader9* wrapped = static_cast<WrappedVertexShader9*>(pShader);
+            realShader = wrapped->GetReal();
+            uint32_t shaderHash = ComputeShaderBytecodeHash(realShader);
             if (shaderHash != 0) {
                 g_shaderBytecodeHashes[g_activeShaderKey] = shaderHash;
             }
         }
 
-        return m_real->SetVertexShader(pShader);
+        return m_real->SetVertexShader(realShader);
     }
     HRESULT STDMETHODCALLTYPE GetVertexShader(IDirect3DVertexShader9** ppShader) override { return m_real->GetVertexShader(ppShader); }
     HRESULT STDMETHODCALLTYPE GetVertexShaderConstantF(UINT StartRegister, float* pConstantData, UINT Vector4fCount) override { return m_real->GetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
@@ -4078,7 +4956,9 @@ public:
     HRESULT STDMETHODCALLTYPE GetPixelShader(IDirect3DPixelShader9** ppShader) override { return m_real->GetPixelShader(ppShader); }
     HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT StartRegister, const float* pConstantData, UINT Vector4fCount) override {
         uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentPixelShader);
-        RecordConstantUpload(ConstantUploadStage_Pixel, shaderKey, StartRegister, Vector4fCount);
+        if (g_constantUploadRecordingEnabled) {
+            RecordConstantUpload(ConstantUploadStage_Pixel, shaderKey, StartRegister, Vector4fCount);
+        }
         return m_real->SetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount);
     }
     HRESULT STDMETHODCALLTYPE GetPixelShaderConstantF(UINT StartRegister, float* pConstantData, UINT Vector4fCount) override { return m_real->GetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
@@ -4090,6 +4970,51 @@ public:
     HRESULT STDMETHODCALLTYPE DrawTriPatch(UINT Handle, const float* pNumSegs, const D3DTRIPATCH_INFO* pTriPatchInfo) override { return m_real->DrawTriPatch(Handle, pNumSegs, pTriPatchInfo); }
     HRESULT STDMETHODCALLTYPE DeletePatch(UINT Handle) override { return m_real->DeletePatch(Handle); }
     HRESULT STDMETHODCALLTYPE CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9** ppQuery) override { return m_real->CreateQuery(Type, ppQuery); }
+
+    HRESULT STDMETHODCALLTYPE SetConvolutionMonoKernel(UINT width, UINT height, float* rows, float* columns) override {
+        return m_realEx ? m_realEx->SetConvolutionMonoKernel(width, height, rows, columns) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE ComposeRects(IDirect3DSurface9* pSrc, IDirect3DSurface9* pDst, IDirect3DVertexBuffer9* pSrcRectDescs,
+                                           UINT numRects, IDirect3DVertexBuffer9* pDstRectDescs, D3DCOMPOSERECTSOP op, int xoffset, int yoffset) override {
+        return m_realEx ? m_realEx->ComposeRects(pSrc, pDst, pSrcRectDescs, numRects, pDstRectDescs, op, xoffset, yoffset) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE PresentEx(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride,
+                                        CONST RGNDATA* pDirtyRegion, DWORD dwFlags) override {
+        return m_realEx ? m_realEx->PresentEx(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags) : Present(pSourceRect,pDestRect,hDestWindowOverride,pDirtyRegion);
+    }
+    HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT* pPriority) override { return m_realEx ? m_realEx->GetGPUThreadPriority(pPriority) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE SetGPUThreadPriority(INT Priority) override { return m_realEx ? m_realEx->SetGPUThreadPriority(Priority) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE WaitForVBlank(UINT iSwapChain) override { return m_realEx ? m_realEx->WaitForVBlank(iSwapChain) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE CheckResourceResidency(IDirect3DResource9** pResourceArray, UINT32 NumResources) override { return m_realEx ? m_realEx->CheckResourceResidency(pResourceArray, NumResources) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override { return m_realEx ? m_realEx->SetMaximumFrameLatency(MaxLatency) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* pMaxLatency) override { return m_realEx ? m_realEx->GetMaximumFrameLatency(pMaxLatency) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND hDestinationWindow) override { return m_realEx ? m_realEx->CheckDeviceState(hDestinationWindow) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE CreateRenderTargetEx(UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample,
+                                                   DWORD MultisampleQuality, BOOL Lockable, IDirect3DSurface9** ppSurface,
+                                                   HANDLE* pSharedHandle, DWORD Usage) override {
+        return m_realEx ? m_realEx->CreateRenderTargetEx(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle, Usage) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE CreateOffscreenPlainSurfaceEx(UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool,
+                                                            IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage) override {
+        return m_realEx ? m_realEx->CreateOffscreenPlainSurfaceEx(Width, Height, Format, Pool, ppSurface, pSharedHandle, Usage) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE CreateDepthStencilSurfaceEx(UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample,
+                                                          DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface,
+                                                          HANDLE* pSharedHandle, DWORD Usage) override {
+        return m_realEx ? m_realEx->CreateDepthStencilSurfaceEx(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle, Usage) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode) override {
+        return m_realEx ? m_realEx->ResetEx(pPresentationParameters, pFullscreenDisplayMode) : Reset(pPresentationParameters);
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplayModeEx(UINT iSwapChain, D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) override {
+        return m_realEx ? m_realEx->GetDisplayModeEx(iSwapChain, pMode, pRotation) : D3DERR_INVALIDCALL;
+    }
+};
+
+class WrappedD3D9DeviceEx : public WrappedD3D9Device {
+public:
+    explicit WrappedD3D9DeviceEx(IDirect3DDevice9Ex* real)
+        : WrappedD3D9Device(real) {}
 };
 
 /**
@@ -4276,10 +5201,8 @@ public:
         HRESULT hr = m_real->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags,
                                             pPresentationParameters, pFullscreenDisplayMode, &realDevice);
         if (SUCCEEDED(hr) && realDevice) {
-            // Note: We wrap as IDirect3DDevice9, but the game expects IDirect3DDevice9Ex
-            // This is a simplification - a full implementation would need a WrappedD3D9DeviceEx
-            LogMsg("CreateDeviceEx succeeded, wrapping device (as base Device9)");
-            *ppReturnedDeviceInterface = (IDirect3DDevice9Ex*)new WrappedD3D9Device(realDevice);
+            LogMsg("CreateDeviceEx succeeded, wrapping device");
+            *ppReturnedDeviceInterface = new WrappedD3D9DeviceEx(realDevice);
         } else {
             LogMsg("CreateDeviceEx failed: 0x%08X", hr);
             *ppReturnedDeviceInterface = nullptr;
@@ -4326,7 +5249,14 @@ void LoadConfig() {
     g_barnyardForceWorldFromC0 = GetPrivateProfileIntA("CameraProxy", "BarnyardForceWorldFromC0", 0, path) != 0;
     g_config.barnyardUseGameSetTransformsForViewProjection =
         GetPrivateProfileIntA("CameraProxy", "BarnyardUseGameSetTransformsForViewProjection", 1, path) != 0;
+    g_config.disableGameInputWhileMenuOpen =
+        GetPrivateProfileIntA("CameraProxy", "DisableGameInputWhileMenuOpen", 0, path) != 0;
+    g_config.setTransformBypassProxyWhenGameProvides =
+        GetPrivateProfileIntA("CameraProxy", "SetTransformBypassProxyWhenGameProvides", 0, path) != 0;
+    g_config.setTransformRoundTripCompatibilityMode =
+        GetPrivateProfileIntA("CameraProxy", "SetTransformRoundTripCompatibilityMode", 0, path) != 0;
     g_imguiBarnyardUseGameSetTransformsForViewProjection = g_config.barnyardUseGameSetTransformsForViewProjection;
+    g_imguiDisableGameInputWhileMenuOpen = g_config.disableGameInputWhileMenuOpen;
     if (g_config.gameProfile[0] != '\0' && g_activeGameProfile == GameProfile_None) {
         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
                  "Unknown GameProfile='%s'. Falling back to structural detection.", g_config.gameProfile);
@@ -4352,12 +5282,19 @@ void LoadConfig() {
 
     g_config.experimentalCustomProjectionEnabled =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionEnabled", 0, path) != 0;
+    int rawMode = GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionMode", 2, path);
     g_config.experimentalCustomProjectionMode =
-        GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionMode", 2, path);
+        (rawMode == CustomProjectionMode_Manual) ? CustomProjectionMode_Manual : CustomProjectionMode_Auto;
     g_config.experimentalCustomProjectionOverrideDetectedProjection =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideDetectedProjection", 0, path) != 0;
     g_config.experimentalCustomProjectionOverrideCombinedMVP =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideCombinedMVP", 0, path) != 0;
+    g_config.experimentalInverseViewAsWorld =
+        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorld", 0, path) != 0;
+    g_config.experimentalInverseViewAsWorldAllowUnverified =
+        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorldAllowUnverified", 0, path) != 0;
+    g_config.experimentalInverseViewAsWorldFast =
+        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorldFast", 0, path) != 0;
     g_config.mgrrUseAutoProjectionWhenC4Invalid =
         GetPrivateProfileIntA("CameraProxy", "MGRRUseAutoProjectionWhenC4Invalid", 0, path) != 0;
 
@@ -4370,8 +5307,10 @@ void LoadConfig() {
     g_config.experimentalCustomProjectionAutoFarZ = (float)atof(customBuf);
     GetPrivateProfileStringA("CameraProxy", "ExperimentalCustomProjectionAutoAspectFallback", "1.7777778", customBuf, sizeof(customBuf), path);
     g_config.experimentalCustomProjectionAutoAspectFallback = (float)atof(customBuf);
-    g_config.experimentalCustomProjectionAutoHandedness =
+    int rawHandedness =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionAutoHandedness", ProjectionHandedness_Left, path);
+    g_config.experimentalCustomProjectionAutoHandedness =
+        (rawHandedness == ProjectionHandedness_Right) ? ProjectionHandedness_Right : ProjectionHandedness_Left;
 
     D3DMATRIX defaultManualProjection = {};
     CreateProjectionMatrixWithHandedness(&defaultManualProjection,
@@ -4398,88 +5337,17 @@ void LoadConfig() {
     g_config.minFOV = (float)atof(buf);
     GetPrivateProfileStringA("CameraProxy", "MaxFOV", "2.5", buf, sizeof(buf), path);
     g_config.maxFOV = (float)atof(buf);
+    snprintf(g_iniPath, sizeof(g_iniPath), "%s", path);
 }
 
-// DLL entry point
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
-    if (fdwReason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hinstDLL);
-
+static void EnsureProxyInitialized() {
+    std::call_once(g_initOnce, []() {
         LoadConfig();
-
         if (g_config.enableLogging) {
             g_logFile = fopen("camera_proxy.log", "w");
             LogMsg("=== DMC4 Camera Proxy for D3D9 ===");
-            LogMsg("View matrix register override: %s", g_config.viewMatrixRegister >= 0 ? "ENABLED" : "auto");
-            if (g_config.viewMatrixRegister >= 0) {
-                LogMsg("  View override range: c%d-c%d", g_config.viewMatrixRegister, g_config.viewMatrixRegister + 3);
-            }
-            LogMsg("Projection matrix register override: %s", g_config.projMatrixRegister >= 0 ? "ENABLED" : "auto");
-            if (g_config.projMatrixRegister >= 0) {
-                LogMsg("  Projection override range: c%d-c%d", g_config.projMatrixRegister, g_config.projMatrixRegister + 3);
-            }
-            LogMsg("World matrix register override: %s", g_config.worldMatrixRegister >= 0 ? "ENABLED" : "auto");
-            if (g_config.worldMatrixRegister >= 0) {
-                LogMsg("  World override range: c%d-c%d", g_config.worldMatrixRegister, g_config.worldMatrixRegister + 3);
-            }
-            LogMsg("Auto-detect matrices: %s", g_config.autoDetectMatrices ? "ENABLED" : "disabled");
-            LogMsg("Log all constants: %s", g_config.logAllConstants ? "ENABLED" : "disabled");
-            LogMsg("Memory scanner: %s", g_config.enableMemoryScanner ? "ENABLED" : "disabled");
-            LogMsg("Use Remix runtime: %s", g_config.useRemixRuntime ? "ENABLED" : "disabled");
-            LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
-            LogMsg("Emit fixed-function transforms: %s", g_config.emitFixedFunctionTransforms ? "ENABLED" : "disabled");
-            LogMsg("Combined MVP handling: %s", g_config.enableCombinedMVP ? "ENABLED" : "disabled");
-            LogMsg("Combined MVP require world: %s", g_config.combinedMVPRequireWorld ? "yes" : "no");
-            LogMsg("Combined MVP assume identity world: %s", g_config.combinedMVPAssumeIdentityWorld ? "yes" : "no");
-            LogMsg("Combined MVP force decomposition: %s", g_config.combinedMVPForceDecomposition ? "yes" : "no");
-            LogMsg("Combined MVP log decomposition: %s", g_config.combinedMVPLogDecomposition ? "yes" : "no");
-            LogMsg("Experimental custom projection: %s", g_config.experimentalCustomProjectionEnabled ? "ENABLED" : "disabled");
-            LogMsg("Experimental custom projection mode: %s",
-                   g_config.experimentalCustomProjectionMode == 1 ? "manual" :
-                   (g_config.experimentalCustomProjectionMode == 2 ? "auto" : "invalid"));
-            LogMsg("Experimental custom projection overrides detected projection: %s",
-                   g_config.experimentalCustomProjectionOverrideDetectedProjection ? "yes" : "no");
-            LogMsg("Experimental custom projection overrides combined MVP: %s",
-                   g_config.experimentalCustomProjectionOverrideCombinedMVP ? "yes" : "no");
-            LogMsg("MGR: use auto projection when c4 projection is invalid: %s",
-                   g_config.mgrrUseAutoProjectionWhenC4Invalid ? "yes" : "no");
-            LogMsg("Barnyard: force world from c0-c3: %s",
-                   g_barnyardForceWorldFromC0 ? "yes" : "no");
-            LogMsg("Barnyard: use intercepted game view/proj transforms: %s",
-                   g_config.barnyardUseGameSetTransformsForViewProjection ? "yes" : "no");
-            LogMsg("Experimental custom projection auto params: fov=%.2f near=%.5f far=%.2f aspectFallback=%.5f handedness=%s",
-                   g_config.experimentalCustomProjectionAutoFovDeg,
-                   g_config.experimentalCustomProjectionAutoNearZ,
-                   g_config.experimentalCustomProjectionAutoFarZ,
-                   g_config.experimentalCustomProjectionAutoAspectFallback,
-                   ProjectionHandednessLabel(static_cast<ProjectionHandedness>(g_config.experimentalCustomProjectionAutoHandedness)));
-            LogMsg("Game profile: %s", GameProfileLabel(g_activeGameProfile));
-            if (g_activeGameProfile == GameProfile_DevilMayCry4) {
-                LogMsg("DMC4 layout: mvp/world=c%d-c%d, view=c%d-c%d, proj=c%d-c%d",
-                       g_profileLayout.combinedMvpBase, g_profileLayout.combinedMvpBase + 3,
-                       g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3,
-                       g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3);
-            }
-            LogMsg("ImGui scale: %.2fx", g_config.imguiScale);
-            LogMsg("Probe transposed layouts: %s", g_probeTransposedLayouts ? "ENABLED" : "disabled");
-            LogMsg("Probe inverse view: %s", g_probeInverseView ? "ENABLED" : "disabled");
-            LogMsg("Override scope mode: %d (N=%d)", g_overrideScopeMode, g_overrideNFrames);
-            LogMsg("Hotkeys (VK): menu=%d pause=%d emit=%d resetOverrides=%d",
-                   g_config.hotkeyToggleMenuVk,
-                   g_config.hotkeyTogglePauseVk,
-                   g_config.hotkeyEmitMatricesVk,
-                   g_config.hotkeyResetMatrixOverridesVk);
-            if (g_config.enableMemoryScanner) {
-                LogMsg("Memory scanner interval: %d sec", g_config.memoryScannerIntervalSec);
-                LogMsg("Memory scanner module: %s", g_config.memoryScannerModule[0]
-                                                   ? g_config.memoryScannerModule
-                                                   : "<main module>");
-            }
         }
-
-        // Load the real D3D9 runtime (Remix or system, based on config)
         g_hD3D9 = LoadTargetD3D9();
-
         if (g_hD3D9) {
             g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hD3D9, "Direct3DCreate9");
             g_origDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hD3D9, "Direct3DCreate9Ex");
@@ -4490,22 +5358,20 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             g_origD3DPERF_SetMarker = (D3DPERF_SetMarker_t)GetProcAddress(g_hD3D9, "D3DPERF_SetMarker");
             g_origD3DPERF_SetOptions = (D3DPERF_SetOptions_t)GetProcAddress(g_hD3D9, "D3DPERF_SetOptions");
             g_origD3DPERF_SetRegion = (D3DPERF_SetRegion_t)GetProcAddress(g_hD3D9, "D3DPERF_SetRegion");
-            LogMsg("Loaded target d3d9 runtime successfully");
-            LogMsg("  Direct3DCreate9: %p", g_origDirect3DCreate9);
-            LogMsg("  Direct3DCreate9Ex: %p", g_origDirect3DCreate9Ex);
-        } else {
-            LogMsg("ERROR: Failed to load target d3d9 runtime!");
         }
-    }
-    else if (fdwReason == DLL_PROCESS_DETACH) {
-        if (g_logFile) {
-            LogMsg("=== Camera Proxy unloading ===");
-            LogMsg("Total frames: %d", g_frameCount);
-            fclose(g_logFile);
-        }
-        if (g_hD3D9) {
-            FreeLibrary(g_hD3D9);
-        }
+    });
+}
+
+// DLL entry point
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    (void)lpvReserved;
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        g_moduleInstance = hinstDLL;
+        DisableThreadLibraryCalls(hinstDLL);
+    } else if (fdwReason == DLL_PROCESS_DETACH) {
+        g_moduleInstance = nullptr;
+        if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+        if (g_hD3D9) { FreeLibrary(g_hD3D9); g_hD3D9 = nullptr; }
     }
     return TRUE;
 }
@@ -4516,10 +5382,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 
 extern "C" {
     __declspec(dllexport) const CameraMatrices* WINAPI Proxy_GetCameraMatrices() {
-        return &g_cameraMatrices;
+        static CameraMatrices snapshot = {};
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        snapshot = g_cameraMatrices;
+        return &snapshot;
     }
 
     IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT SDKVersion) {
+        EnsureProxyInitialized();
         LogMsg("Direct3DCreate9 called (SDK version: %d)", SDKVersion);
 
         if (!g_origDirect3DCreate9) {
@@ -4538,6 +5408,7 @@ extern "C" {
     }
 
     HRESULT WINAPI Proxy_Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3D) {
+        EnsureProxyInitialized();
         LogMsg("Direct3DCreate9Ex called (SDK version: %d)", SDKVersion);
 
         if (!g_origDirect3DCreate9Ex) {
