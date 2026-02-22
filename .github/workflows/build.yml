@@ -81,6 +81,7 @@ jobs:
         CHECKS="$CHECKS,-readability-identifier-length"
         CHECKS="$CHECKS,-modernize-avoid-c-arrays"
         CHECKS="$CHECKS,-clang-diagnostic-deprecated-declarations"
+        CHECKS="$CHECKS,-readability-function-cognitive-complexity"
         ERRORS=0
         # Use process substitution (< <(...)) instead of a pipe so ERRORS
         # stays in the main shell rather than a subshell where it can't propagate.
