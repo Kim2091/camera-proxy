@@ -4070,7 +4070,8 @@ static void RenderImGuiOverlay(IDirect3DDevice9 *device) {
 
 // Function pointer types
 using Direct3DCreate9_t = IDirect3D9 *(__stdcall *)(UINT SDKVersion);
-using Direct3DCreate9Ex_t = HRESULT(__stdcall *)(UINT SDKVersion, IDirect3D9Ex **);
+using Direct3DCreate9Ex_t = HRESULT(__stdcall *)(UINT SDKVersion,
+                                                 IDirect3D9Ex **);
 using D3DPERF_BeginEvent_t = int(__stdcall *)(D3DCOLOR, LPCWSTR);
 using D3DPERF_EndEvent_t = int(__stdcall *)(void);
 using D3DPERF_GetStatus_t = DWORD(__stdcall *)(void);
