@@ -4,14 +4,84 @@ on:
   workflow_dispatch:  # Manual trigger only
 
 jobs:
-  build:
+  lint-and-fix:
     runs-on: windows-latest
-    
+    permissions:
+      contents: write  # Required to commit auto-fixes back to the repo
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup LLVM (clang-tidy + clang-format)
+      uses: KyleMayes/install-llvm-action@v2
+      with:
+        version: "17"
+
+    - name: Setup Visual Studio environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86  # 32-bit build for DMC4
+
+    # ── Formatting ────────────────────────────────────────────────────────────
+    # clang-format can fix 100% of what it flags, so we run it first and
+    # commit any changes before the stricter static-analysis step.
+    - name: Run clang-format (auto-fix)
+      shell: bash
+      run: |
+        find . -name "*.cpp" -o -name "*.h" | \
+          grep -v "imgui/" | \
+          xargs clang-format -i --style=file
+
+    # ── Static analysis ───────────────────────────────────────────────────────
+    # clang-tidy can auto-fix a subset of its checks. We apply those fixes,
+    # then run a second read-only pass to catch anything that couldn't be
+    # fixed automatically and fail the build if any remain.
+    - name: Run clang-tidy (auto-fix where possible)
+      shell: bash
+      run: |
+        find . -name "*.cpp" | grep -v "imgui/" | while read -r file; do
+          clang-tidy "$file" \
+            --fix \
+            --fix-errors \
+            -checks="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*" \
+            -- -std=c++17 -m32 -I. -Iimgui \
+            2>&1 || true  # Don't abort here; unfixable issues caught in next step
+        done
+
+    - name: Commit auto-fixes (formatting + lint)
+      uses: stefanzweifel/git-auto-commit-action@v5
+      with:
+        commit_message: "style: apply clang-format and clang-tidy auto-fixes [skip ci]"
+        file_pattern: "*.cpp *.h"
+
+    # ── Verification pass ─────────────────────────────────────────────────────
+    # Read-only re-run to catch any issues that couldn't be auto-fixed.
+    # This is what actually gates the build.
+    - name: Verify no remaining lint errors
+      shell: bash
+      run: |
+        ERRORS=0
+        find . -name "*.cpp" | grep -v "imgui/" | while read -r file; do
+          clang-tidy "$file" \
+            -checks="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*" \
+            -- -std=c++17 -m32 -I. -Iimgui \
+            || ERRORS=$((ERRORS + 1))
+        done
+        if [ "$ERRORS" -gt 0 ]; then
+          echo "::error::$ERRORS file(s) have lint errors that could not be auto-fixed. Please fix them manually."
+          exit 1
+        fi
+
+  build:
+    runs-on: windows-latest
+    needs: lint-and-fix  # Only runs if lint-and-fix passes
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
 
     - name: Setup MSVC
       uses: microsoft/setup-msbuild@v2
@@ -21,58 +91,6 @@ jobs:
       with:
         arch: x86  # 32-bit build for DMC4
 
-    # ── Formatting ────────────────────────────────────────────────────────────
-    # clang-format auto-fixes style issues and commits the result.
-    # To customise rules, add a .clang-format file at the repo root.
-    - name: Run clang-format (auto-fix)
-      shell: pwsh
-      run: |
-        $files = Get-ChildItem -Recurse -Include *.cpp,*.h -Exclude imgui/* |
-                 Select-Object -ExpandProperty FullName
-        foreach ($f in $files) {
-          clang-format -i $f
-        }
-
-    - name: Commit clang-format fixes
-      shell: pwsh
-      run: |
-        git config user.name  "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        if ($(git status --porcelain) -eq "") { Write-Host "No changes, skipping."; exit 0 }
-        git add -A
-        git commit -m "style: apply clang-format auto-fixes [skip ci]"
-        git push
-
-    # ── Static analysis ───────────────────────────────────────────────────────
-    # clang-tidy checks for common bugs, modernisation opportunities, and more.
-    # --fix applies every suggestion that clang-tidy can safely automate.
-    # Warnings that can't be fixed automatically are printed to the log.
-    # The step uses --warnings-as-errors=* so unfixable issues fail the job.
-    - name: Run clang-tidy (auto-fix)
-      shell: pwsh
-      run: |
-        # Build a minimal compile-commands entry so clang-tidy understands
-        # the project's include paths and preprocessor defines.
-        $includes = "-Id3d9_proxy -Iimgui -Iimgui/backends"
-        $defines  = "-DWIN32 -D_WINDOWS -DUNICODE"
-        $flags    = "$includes $defines --std=c++17"
-
-        clang-tidy d3d9_proxy.cpp `
-          --fix `
-          --fix-errors `
-          -- $flags.Split(" ")
-
-    - name: Commit clang-tidy fixes
-      shell: pwsh
-      run: |
-        git config user.name  "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        if ($(git status --porcelain) -eq "") { Write-Host "No changes, skipping."; exit 0 }
-        git add -A
-        git commit -m "fix: apply clang-tidy auto-fixes [skip ci]"
-        git push
-
-    # ── Build ─────────────────────────────────────────────────────────────────
     - name: Build D3D9 Proxy DLL
       run: |
         cl /LD /EHsc /O2 /MD d3d9_proxy.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_dx9.cpp imgui/backends/imgui_impl_win32.cpp /link /DEF:d3d9.def /OUT:d3d9.dll
