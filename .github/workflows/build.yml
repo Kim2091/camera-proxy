@@ -4,89 +4,26 @@ on:
   workflow_dispatch:  # Manual trigger only
 
 jobs:
-  lint-and-fix:
-    runs-on: windows-latest
-    permissions:
-      contents: write  # Required to commit auto-fixes back to the repo
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Setup LLVM (clang-tidy + clang-format)
-      uses: KyleMayes/install-llvm-action@v2
-      with:
-        version: "17"
-
-    - name: Setup Visual Studio environment
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x86  # 32-bit build for DMC4
-
-    # ── Formatting ────────────────────────────────────────────────────────────
-    - name: Run clang-format (auto-fix)
-      shell: bash
-      run: |
-        find . -name "*.cpp" -o -name "*.h" | \
-          grep -v "imgui/" | \
-          xargs clang-format -i --style=file
-
-    # ── Static analysis ───────────────────────────────────────────────────────
-    - name: Run clang-tidy (auto-fix where possible)
-      shell: bash
-      run: |
-        find . -name "*.cpp" | grep -v "imgui/" | while read -r file; do
-          clang-tidy "$file" \
-            --fix \
-            --fix-errors \
-            -checks="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*" \
-            -- -std=c++17 -m32 -I. -Iimgui \
-            2>&1 || true  # Don't abort here; unfixable issues caught in next step
-        done
-
-    - name: Commit auto-fixes (formatting + lint)
-      uses: stefanzweifel/git-auto-commit-action@v5
-      with:
-        commit_message: "style: apply clang-format and clang-tidy auto-fixes [skip ci]"
-        file_pattern: "*.cpp *.h"
-
-    # ── Verification pass ─────────────────────────────────────────────────────
-    # Read-only re-run to log any remaining issues that couldn't be auto-fixed.
-    # These are treated as warnings only — build is not gated on lint.
-    - name: Report remaining lint warnings (non-blocking)
-      shell: bash
-      run: |
-        find . -name "*.cpp" | grep -v "imgui/" | while read -r file; do
-          clang-tidy "$file" \
-            -checks="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*" \
-            -- -std=c++17 -m32 -I. -Iimgui \
-            || true  # Non-fatal — unfixable warnings are acceptable
-        done
-        echo "Lint check complete. Any remaining warnings above are non-blocking."
-
   build:
     runs-on: windows-latest
-    needs: lint-and-fix  # Only runs if lint-and-fix passes
-
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
+    
     - name: Setup MSVC
       uses: microsoft/setup-msbuild@v2
-
+    
     - name: Setup Visual Studio environment
       uses: ilammy/msvc-dev-cmd@v1
       with:
         arch: x86  # 32-bit build for DMC4
-
+    
     - name: Build D3D9 Proxy DLL
       run: |
-        cl /LD /EHsc /O2 /MD /std:c++17 d3d9_proxy.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_dx9.cpp imgui/backends/imgui_impl_win32.cpp /link /DEF:d3d9.def /OUT:d3d9.dll
+        cl /LD /EHsc /O2 /MD d3d9_proxy.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_dx9.cpp imgui/backends/imgui_impl_win32.cpp /link /DEF:d3d9.def /OUT:d3d9.dll
       shell: cmd
-
+    
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
