@@ -4069,15 +4069,15 @@ static void RenderImGuiOverlay(IDirect3DDevice9 *device) {
 }
 
 // Function pointer types
-using Direct3DCreate9_t = IDirect3D9 *(*)(UINT); __attribute__((stdcall)))(UINT SDKVersion);
-using Direct3DCreate9Ex_t = HRESULT (*)(UINT, IDirect3D9Ex **); __attribute__((stdcall)))(UINT SDKVersion, IDirect3D9Ex **);
-using D3DPERF_BeginEvent_t = int (*)(D3DCOLOR, LPCWSTR); __attribute__((stdcall)))(D3DCOLOR, LPCWSTR);
-using D3DPERF_EndEvent_t = int (*)(); __attribute__((stdcall)))(void);
-using D3DPERF_GetStatus_t = DWORD (*)(); __attribute__((stdcall)))(void);
-using D3DPERF_QueryRepeatFrame_t = BOOL (*)(); __attribute__((stdcall)))(void);
-using D3DPERF_SetMarker_t = void (*)(D3DCOLOR, LPCWSTR); __attribute__((stdcall)))(D3DCOLOR, LPCWSTR);
-using D3DPERF_SetOptions_t = void (*)(DWORD); __attribute__((stdcall)))(DWORD);
-using D3DPERF_SetRegion_t = void (*)(D3DCOLOR, LPCWSTR); __attribute__((stdcall)))(D3DCOLOR, LPCWSTR);
+using Direct3DCreate9_t = IDirect3D9 *(__stdcall *)(UINT SDKVersion);
+using Direct3DCreate9Ex_t = HRESULT(__stdcall *)(UINT SDKVersion, IDirect3D9Ex **);
+using D3DPERF_BeginEvent_t = int(__stdcall *)(D3DCOLOR, LPCWSTR);
+using D3DPERF_EndEvent_t = int(__stdcall *)(void);
+using D3DPERF_GetStatus_t = DWORD(__stdcall *)(void);
+using D3DPERF_QueryRepeatFrame_t = BOOL(__stdcall *)(void);
+using D3DPERF_SetMarker_t = void(__stdcall *)(D3DCOLOR, LPCWSTR);
+using D3DPERF_SetOptions_t = void(__stdcall *)(DWORD);
+using D3DPERF_SetRegion_t = void(__stdcall *)(D3DCOLOR, LPCWSTR);
 
 static Direct3DCreate9_t g_origDirect3DCreate9 = nullptr;
 static Direct3DCreate9Ex_t g_origDirect3DCreate9Ex = nullptr;
