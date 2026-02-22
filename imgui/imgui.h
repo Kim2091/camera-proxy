@@ -3046,10 +3046,10 @@ enum ImGuiKey : int {
                              // Cancel / Close / Exit
   ImGuiKey_GamepadFaceUp, // Y (Xbox)         X (Switch)   Triangle (PS)      //
                           // Text Input / On-screen Keyboard
-  ImGuiKey_GamepadFaceDown, // A (Xbox)         B (Switch)   Cross (PS) //
-                            // Activate / Open / Toggle / Tweak
-  ImGuiKey_GamepadDpadLeft, // D-pad Left // Move / Tweak / Resize Window (in
-                            // Windowing mode)
+  ImGuiKey_GamepadFaceDown,  // A (Xbox)         B (Switch)   Cross (PS) //
+                             // Activate / Open / Toggle / Tweak
+  ImGuiKey_GamepadDpadLeft,  // D-pad Left // Move / Tweak / Resize Window (in
+                             // Windowing mode)
   ImGuiKey_GamepadDpadRight, // D-pad Right // Move / Tweak / Resize Window (in
                              // Windowing mode)
   ImGuiKey_GamepadDpadUp, // D-pad Up                                         //
@@ -3338,7 +3338,7 @@ enum ImGuiCol_ {
   ImGuiCol_TabDimmedSelected, // Tab background, when tab-bar is unfocused & tab
                               // is selected
   ImGuiCol_TabDimmedSelectedOverline, //..horizontal overline, when tab-bar is
-                                      //unfocused & tab is selected
+                                      // unfocused & tab is selected
   ImGuiCol_PlotLines,
   ImGuiCol_PlotLinesHovered,
   ImGuiCol_PlotHistogram,
@@ -3746,10 +3746,9 @@ enum ImGuiTableFlags_ {
       1 << 13, // Columns default to _WidthFixed or _WidthAuto (if resizable or
                // not resizable), matching contents width.
   ImGuiTableFlags_SizingFixedSame =
-      2
-      << 13, // Columns default to _WidthFixed or _WidthAuto (if resizable or
-             // not resizable), matching the maximum contents width of all
-             // columns. Implicitly enable ImGuiTableFlags_NoKeepColumnsVisible.
+      2 << 13, // Columns default to _WidthFixed or _WidthAuto (if resizable or
+               // not resizable), matching the maximum contents width of all
+  // columns. Implicitly enable ImGuiTableFlags_NoKeepColumnsVisible.
   ImGuiTableFlags_SizingStretchProp =
       3 << 13, // Columns default to _WidthStretch with default weights
                // proportional to each columns contents widths.
@@ -4952,8 +4951,8 @@ struct ImGuiInputTextCallbackData {
                   // string.length()
   int BufSize;    // Buffer size (in bytes) = capacity+1  // Read-only    //
                   // [Resize,Completion,History,Always] Include zero-terminator
-               // storage. In C land == ARRAYSIZE(my_char_array), in C++ land:
-               // string.capacity()+1
+  // storage. In C land == ARRAYSIZE(my_char_array), in C++ land:
+  // string.capacity()+1
   bool BufDirty; // Set if you modify Buf/BufTextLen!    // Write        //
                  // [Completion,History,Always]
   int CursorPos; //                                      // Read-write   //
@@ -6019,8 +6018,8 @@ struct ImFontConfig {
                     // positioning. Note the difference between 2 and 3 is
                     // minimal. You can reduce this to 1 for large glyphs save
                     // memory. Read
-                   // https://github.com/nothings/stb/blob/master/tests/oversample/README.md
-                   // for details.
+  // https://github.com/nothings/stb/blob/master/tests/oversample/README.md
+  // for details.
   int OversampleV; // 1        // Rasterize at higher quality for sub-pixel
                    // positioning. This is not really useful as we don't use
                    // sub-pixel positions on the Y axis.
@@ -6106,16 +6105,17 @@ struct ImFontGlyphRangesBuilder {
     int off = (int)(n >> 5);
     ImU32 mask = 1u << (n & 31);
     UsedChars[off] |= mask;
-  }                                             // Set bit n in the array
+  } // Set bit n in the array
   inline void AddChar(ImWchar c) { SetBit(c); } // Add character
   IMGUI_API void AddText(
       const char *text,
       const char *text_end =
           NULL); // Add string (each character of the UTF-8 string are added)
-  IMGUI_API void
-  AddRanges(const ImWchar *ranges); // Add ranges, e.g.
-                                    // builder.AddRanges(ImFontAtlas::GetGlyphRangesDefault())
-                                    // to force add all of ASCII/Latin+Ext
+  IMGUI_API void AddRanges(
+      const ImWchar
+          *ranges); // Add ranges, e.g.
+                    // builder.AddRanges(ImFontAtlas::GetGlyphRangesDefault())
+                    // to force add all of ASCII/Latin+Ext
   IMGUI_API void
   BuildRanges(ImVector<ImWchar> *out_ranges); // Output new ranges
 };
@@ -6655,7 +6655,7 @@ IMGUI_API ImGuiKey GetKeyIndex(
 // Renamed in 1.77, renamed back in 1.79. Sorry!
 //-- OBSOLETED in 1.78 (from June 2020): Old drag/sliders functions that took a
 //'float power > 1.0f' argument instead of ImGuiSliderFlags_Logarithmic. See
-//github.com/ocornut/imgui/issues/3361 for details. IMGUI_API bool
+// github.com/ocornut/imgui/issues/3361 for details. IMGUI_API bool
 // DragScalar(const char* label, ImGuiDataType data_type, void* p_data, float
 // v_speed, const void* p_min, const void* p_max, const char* format, float
 // power = 1.0f)                                                            //
@@ -6774,7 +6774,7 @@ IMGUI_API ImGuiKey GetKeyIndex(
 } // namespace ImGui
 
 //-- OBSOLETED in 1.82 (from Mars 2021): flags for AddRect(), AddRectFilled(),
-//AddImageRounded(), PathRect() typedef ImDrawFlags ImDrawCornerFlags; enum
+// AddImageRounded(), PathRect() typedef ImDrawFlags ImDrawCornerFlags; enum
 // ImDrawCornerFlags_
 //{
 //    ImDrawCornerFlags_None      = ImDrawFlags_RoundCornersNone,         // Was

@@ -2314,15 +2314,14 @@ struct ImGuiKeyOwnerData {
 enum ImGuiInputFlagsPrivate_ {
   // Flags for IsKeyPressed(), IsKeyChordPressed(), IsMouseClicked(), Shortcut()
   // - Repeat mode: Repeat rate selection
-  ImGuiInputFlags_RepeatRateDefault = 1 << 1, // Repeat rate: Regular (default)
-  ImGuiInputFlags_RepeatRateNavMove = 1 << 2, // Repeat rate: Fast
-  ImGuiInputFlags_RepeatRateNavTweak =
-      1 << 3, // Repeat rate: Faster
-              // - Repeat mode: Specify when repeating key pressed can be
-              // interrupted.
-              // - In theory ImGuiInputFlags_RepeatUntilOtherKeyPress may be a
-              // desirable default, but it would break too many behavior so
-              // everything is opt-in.
+  ImGuiInputFlags_RepeatRateDefault = 1 << 1,  // Repeat rate: Regular (default)
+  ImGuiInputFlags_RepeatRateNavMove = 1 << 2,  // Repeat rate: Fast
+  ImGuiInputFlags_RepeatRateNavTweak = 1 << 3, // Repeat rate: Faster
+  // - Repeat mode: Specify when repeating key pressed can be
+  // interrupted.
+  // - In theory ImGuiInputFlags_RepeatUntilOtherKeyPress may be a
+  // desirable default, but it would break too many behavior so
+  // everything is opt-in.
   ImGuiInputFlags_RepeatUntilRelease =
       1 << 4, // Stop repeating when released (default for all functions except
               // Shortcut). This only exists to allow overriding Shortcut()
