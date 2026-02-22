@@ -4625,10 +4625,9 @@ static auto BuildExperimentalCustomProjectionMatrix(
   TryGetCurrentDisplayAspect(device, hwnd, &aspect, &width, &height);
 
   const float safeAspect = (std::max)(0.1F, aspect);
-  const float fovDeg =
-      (std::max)(1.0F,
-                 (std::min)(g_config.experimentalCustomProjectionAutoFovDeg,
-                            179.0F));
+  const float fovDeg = (std::max)(
+      1.0F,
+      (std::min)(g_config.experimentalCustomProjectionAutoFovDeg, 179.0F));
   const float nearZ =
       (std::max)(0.0001F, g_config.experimentalCustomProjectionAutoNearZ);
   const float farZ =
