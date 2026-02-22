@@ -42,11 +42,23 @@ jobs:
     - name: Run clang-tidy (auto-fix where possible)
       shell: bash
       run: |
+        # Disabled checks explanation:
+        #   modernize-use-trailing-return-type   — conflicts with WINAPI/BOOL calling conventions
+        #   readability-magic-numbers            — too noisy in D3D/Win32 code (flags SDK constants)
+        #   readability-identifier-length        — flags idiomatic Win32 names like 'hr', 'cb'
+        #   modernize-avoid-c-arrays             — char[] arrays are standard in Win32/interop code
+        #   clang-diagnostic-deprecated-declarations — MSVC fopen_s deprecation is a false positive here
+        CHECKS="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*"
+        CHECKS="$CHECKS,-modernize-use-trailing-return-type"
+        CHECKS="$CHECKS,-readability-magic-numbers"
+        CHECKS="$CHECKS,-readability-identifier-length"
+        CHECKS="$CHECKS,-modernize-avoid-c-arrays"
+        CHECKS="$CHECKS,-clang-diagnostic-deprecated-declarations"
         find . -name "*.cpp" | grep -v "imgui/" | while read -r file; do
           clang-tidy "$file" \
             --fix \
             --fix-errors \
-            -checks="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*" \
+            -checks="$CHECKS" \
             -- -std=c++17 -m32 -I. -Iimgui \
             2>&1 || true  # Don't abort here; unfixable issues caught in next step
         done
@@ -63,13 +75,21 @@ jobs:
     - name: Verify no remaining lint errors
       shell: bash
       run: |
+        CHECKS="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*"
+        CHECKS="$CHECKS,-modernize-use-trailing-return-type"
+        CHECKS="$CHECKS,-readability-magic-numbers"
+        CHECKS="$CHECKS,-readability-identifier-length"
+        CHECKS="$CHECKS,-modernize-avoid-c-arrays"
+        CHECKS="$CHECKS,-clang-diagnostic-deprecated-declarations"
         ERRORS=0
-        find . -name "*.cpp" | grep -v "imgui/" | while read -r file; do
+        # Use process substitution (< <(...)) instead of a pipe so ERRORS
+        # stays in the main shell rather than a subshell where it can't propagate.
+        while read -r file; do
           clang-tidy "$file" \
-            -checks="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*" \
+            -checks="$CHECKS" \
             -- -std=c++17 -m32 -I. -Iimgui \
             || ERRORS=$((ERRORS + 1))
-        done
+        done < <(find . -name "*.cpp" | grep -v "imgui/")
         if [ "$ERRORS" -gt 0 ]; then
           echo "::error::$ERRORS file(s) have lint errors that could not be auto-fixed. Please fix them manually."
           exit 1
