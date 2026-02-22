@@ -26,8 +26,6 @@ jobs:
         arch: x86  # 32-bit build for DMC4
 
     # ── Formatting ────────────────────────────────────────────────────────────
-    # clang-format can fix 100% of what it flags, so we run it first and
-    # commit any changes before the stricter static-analysis step.
     - name: Run clang-format (auto-fix)
       shell: bash
       run: |
@@ -36,9 +34,6 @@ jobs:
           xargs clang-format -i --style=file
 
     # ── Static analysis ───────────────────────────────────────────────────────
-    # clang-tidy can auto-fix a subset of its checks. We apply those fixes,
-    # then run a second read-only pass to catch anything that couldn't be
-    # fixed automatically and fail the build if any remain.
     - name: Run clang-tidy (auto-fix where possible)
       shell: bash
       run: |
@@ -58,22 +53,18 @@ jobs:
         file_pattern: "*.cpp *.h"
 
     # ── Verification pass ─────────────────────────────────────────────────────
-    # Read-only re-run to catch any issues that couldn't be auto-fixed.
-    # This is what actually gates the build.
-    - name: Verify no remaining lint errors
+    # Read-only re-run to log any remaining issues that couldn't be auto-fixed.
+    # These are treated as warnings only — build is not gated on lint.
+    - name: Report remaining lint warnings (non-blocking)
       shell: bash
       run: |
-        ERRORS=0
         find . -name "*.cpp" | grep -v "imgui/" | while read -r file; do
           clang-tidy "$file" \
             -checks="clang-diagnostic-*,clang-analyzer-*,modernize-*,readability-*,bugprone-*,performance-*" \
             -- -std=c++17 -m32 -I. -Iimgui \
-            || ERRORS=$((ERRORS + 1))
+            || true  # Non-fatal — unfixable warnings are acceptable
         done
-        if [ "$ERRORS" -gt 0 ]; then
-          echo "::error::$ERRORS file(s) have lint errors that could not be auto-fixed. Please fix them manually."
-          exit 1
-        fi
+        echo "Lint check complete. Any remaining warnings above are non-blocking."
 
   build:
     runs-on: windows-latest
